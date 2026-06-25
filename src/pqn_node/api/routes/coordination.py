@@ -114,7 +114,7 @@ async def protocol_cancelled(
 
 @router.post("/collect_follower")
 async def collect_follower(
-    request: Request, address: str, state: StateDep, http_client: ClientDep
+    request: Request, state: StateDep, http_client: ClientDep
 ) -> CollectFollowerResponse:
     """
     Endpoint called by a leader node (this one) to request a follower node (other node) to follow it.
@@ -123,6 +123,9 @@ async def collect_follower(
     -------
         CollectFollowerResponse indicating if the follower accepted the request.
     """
+    address = settings.follower_node_address
+    if address is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured")
     logger.info("Requesting client at %s to follow", address)
 
     # Get the port this server is listening on

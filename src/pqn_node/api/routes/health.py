@@ -2,13 +2,11 @@ import concurrent.futures
 import logging
 import time
 from collections.abc import Callable
-from typing import Annotated
 from typing import TypeVar
 
 import httpx
 import serial
 from fastapi import APIRouter
-from fastapi import Query
 from pqn_hardware.network.client import Client
 from pydantic import BaseModel
 from pydantic import Field
@@ -175,10 +173,9 @@ def _probe_follower(follower_node_address: str) -> ComponentStatus:
 
 
 @router.get("/")
-def health(
-    follower_node_address: Annotated[str | None, Query()] = None,
-) -> HealthStatus:
+def health() -> HealthStatus:
     """Probe router, configured devices, rotary encoder, and optional follower node."""
+    follower_node_address = settings.follower_node_address
     try:
         router_status, client = _run_with_timeout(_connect_router, _ROUTER_WALL_TIMEOUT_S)
     except concurrent.futures.TimeoutError:
@@ -219,9 +216,22 @@ def health(
     else:
         follower_node = None
 
+    _apply_games_override(router_status, follower_node)
+
     return HealthStatus(
         router=router_status,
         devices=devices,
         rotary_encoder=rotary_encoder,
         follower_node=follower_node,
     )
+
+
+def _apply_games_override(router_status: ComponentStatus, follower_node: ComponentStatus | None) -> None:
+    ga = settings.games_availability
+    if not router_status.reachable:
+        ga.chsh = False
+        ga.qf = False
+        ga.ssm = False
+    elif follower_node is not None and not follower_node.reachable:
+        ga.chsh = False
+        ga.ssm = False

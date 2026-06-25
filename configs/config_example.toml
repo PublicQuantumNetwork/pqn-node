@@ -7,6 +7,10 @@ router_name = "router1"
 router_address = "xx.xx.xx.xx"  # Replace with actual IP address
 router_port = 5555
 
+# Address of the peer (follower) node used for two-player protocols (CHSH, QKD/SSM).
+# The health check probes this address on startup and disables CHSH/SSM if unreachable.
+follower_node_address = "xx.xx.xx.xx:8000"  # Replace with actual follower node address
+
 # Rotary encoder serial adress
 rotary_encoder_address = "/dev/tty.usbmodem1101"
 
