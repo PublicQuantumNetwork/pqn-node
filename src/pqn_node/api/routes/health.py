@@ -1,6 +1,9 @@
+import concurrent.futures
 import logging
 import time
+from collections.abc import Callable
 from typing import Annotated
+from typing import TypeVar
 
 import httpx
 import serial
@@ -17,7 +20,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/health", tags=["health"])
 
 _ROUTER_TIMEOUT_MS = 5000
+_ROUTER_WALL_TIMEOUT_S = 6.0
+
+_DEVICES_WALL_TIMEOUT_S = 6.0
+
+_SERIAL_WALL_TIMEOUT_S = 3.0
+
 _FOLLOWER_TIMEOUT_S = 5.0
+_FOLLOWER_WALL_TIMEOUT_S = 6.0
+
+_T = TypeVar("_T")
+_probe_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
+
+
+def _run_with_timeout(fn: Callable[[], _T], timeout_s: float) -> _T:
+    return _probe_executor.submit(fn).result(timeout=timeout_s)
 
 
 class ComponentStatus(BaseModel):
@@ -162,11 +179,20 @@ def health(
     follower_node_address: Annotated[str | None, Query()] = None,
 ) -> HealthStatus:
     """Probe router, configured devices, rotary encoder, and optional follower node."""
-    router_status, client = _connect_router()
+    try:
+        router_status, client = _run_with_timeout(_connect_router, _ROUTER_WALL_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        router_status = ComponentStatus(reachable=False, error="timeout")
+        client = None
 
     if client is not None:
         try:
-            devices = _probe_devices(client)
+            devices = _run_with_timeout(lambda: _probe_devices(client), _DEVICES_WALL_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            devices = [
+                DeviceStatus(provider=provider, name=name, purpose=purpose, reachable=False, error="timeout")
+                for provider, name, purpose in _configured_devices()
+            ]
         finally:
             client.disconnect()
     else:
@@ -175,8 +201,23 @@ def health(
             for provider, name, purpose in _configured_devices()
         ]
 
-    rotary_encoder = _probe_rotary_encoder()
-    follower_node = _probe_follower(follower_node_address) if follower_node_address else None
+    if not settings.virtual_rotator:
+        try:
+            rotary_encoder = _run_with_timeout(_probe_rotary_encoder, _SERIAL_WALL_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            rotary_encoder = ComponentStatus(reachable=False, error="timeout")
+    else:
+        rotary_encoder = _probe_rotary_encoder()
+
+    if follower_node_address:
+        try:
+            follower_node = _run_with_timeout(
+                lambda: _probe_follower(follower_node_address), _FOLLOWER_WALL_TIMEOUT_S
+            )
+        except concurrent.futures.TimeoutError:
+            follower_node = ComponentStatus(reachable=False, error="timeout")
+    else:
+        follower_node = None
 
     return HealthStatus(
         router=router_status,
