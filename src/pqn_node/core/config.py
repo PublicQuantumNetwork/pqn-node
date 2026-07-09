@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     rotary_encoder_address: str = "/dev/ttyACM0"
     virtual_rotator: bool = False  # If True, use terminal input instead of hardware rotary encoder
     games_availability: GamesAvailability = Field(default_factory=GamesAvailability)
+    follower_node_address: str | None = None
 
     model_config = SettingsConfigDict(
         toml_file="./config.toml",

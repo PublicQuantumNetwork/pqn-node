@@ -16,7 +16,7 @@ authors = [
     { name = "Soroush Hoseini", email = "soroushhoseini0@gmail.com" },
 ]
 dependencies = [
-    "pqn-hardware @ git+https://github.com/PublicQuantumNetwork/pqn-hardware.git@6440be2830fddccb09b461caea023c84b7c3bea1",
+    "pqn-hardware @ git+https://github.com/PublicQuantumNetwork/pqn-hardware.git@master",
     "fastapi[standard]>=0.115.14",
     "httpx>=0.28.1",
     "pydantic>=2.0",

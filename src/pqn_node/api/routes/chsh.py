@@ -77,11 +77,15 @@ async def chsh_progress(state: StateDep) -> StreamingResponse:
 
 async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
     basis: tuple[float, float],
-    follower_node_address: str,
     http_client: ClientDep,
     timetagger_address: str,
     state: StateDep,
 ) -> ChshResult:
+    follower_node_address = settings.follower_node_address
+    if follower_node_address is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
+        )
     logger.debug("Starting CHSH")
 
     # Initialize progress tracking
@@ -91,7 +95,9 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
     chsh_progress_event.set()
 
     logger.debug("Instantiating client")
-    client = Client(host=settings.router_address, port=settings.router_port, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
 
     # TODO: Check if settings.chsh_settings.hwp is set before even trying to get the device.
     hwp = cast("RotatorInstrument", client.get_device(settings.chsh_settings.hwp[0], settings.chsh_settings.hwp[1]))
@@ -186,18 +192,19 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
 @router.post("/")
 async def chsh(
     basis: tuple[float, float],
-    follower_node_address: str,
     http_client: ClientDep,
     timetagger_address: str,
     state: StateDep,
 ) -> ChshResult:
     logger.info("Starting CHSH experiment with basis: %s", basis)
-    return await _chsh(basis, follower_node_address, http_client, timetagger_address, state)
+    return await _chsh(basis, http_client, timetagger_address, state)
 
 
 @router.post("/request-angle-by-basis")
 async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = False) -> bool:
-    client = Client(host=settings.router_address, port=settings.router_port, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     hwp = cast(
         "RotatorInstrument",
         client.get_device(settings.chsh_settings.request_hwp[0], settings.chsh_settings.request_hwp[1]),

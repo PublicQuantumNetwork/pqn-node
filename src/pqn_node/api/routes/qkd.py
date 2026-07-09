@@ -38,13 +38,21 @@ class QKDResult(BaseModel):
 
 
 async def _qkd(
-    follower_node_address: str,
     http_client: ClientDep,
     state: StateDep,
     timetagger_address: str | None = None,
+    follower_node_address: str | None = None,
 ) -> list[int]:
+    if follower_node_address is None:
+        follower_node_address = settings.follower_node_address
+    if follower_node_address is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
+        )
     logger.debug("Starting QKD")
-    client = Client(host=settings.router_address, port=settings.router_port, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     hwp = cast("RotatorInstrument", client.get_device(settings.qkd_settings.hwp[0], settings.qkd_settings.hwp[1]))
 
     if hwp is None:
@@ -126,7 +134,6 @@ async def _qkd(
 
 @router.post("")
 async def qkd(
-    follower_node_address: str,
     http_client: ClientDep,
     state: StateDep,
     timetagger_address: str | None = None,
@@ -139,12 +146,14 @@ async def qkd(
             detail="QKD basis list is empty",
         )
 
-    return await _qkd(follower_node_address, http_client, state, timetagger_address)
+    return await _qkd(http_client, state, timetagger_address)
 
 
 @router.post("/single_bit")
 async def request_qkd_single_pass(state: StateDep) -> bool:
-    client = Client(host=settings.router_address, port=settings.router_port, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     hwp = cast(
         "RotatorInstrument",
         client.get_device(settings.qkd_settings.request_hwp[0], settings.qkd_settings.request_hwp[1]),
@@ -345,7 +354,7 @@ async def _submit_basis_list_leader(
     state.qkd_leader_basis_list = basis_list
     await _wait_for_follower_ready(state, http_client)
 
-    ret = await _qkd(state.followers_address, http_client, state, timetagger_address)
+    ret = await _qkd(http_client, state, timetagger_address, follower_node_address=state.followers_address)
     logger.info("Final QKD bits: %s", str(ret))
 
     # Assemble QKDResult object
