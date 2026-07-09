@@ -727,7 +727,7 @@ wheels = [
 [[package]]
 name = "pqn-hardware"
 version = "0.2.0"
-source = { git = "https://github.com/PublicQuantumNetwork/pqn-hardware.git?rev=6440be2830fddccb09b461caea023c84b7c3bea1#6440be2830fddccb09b461caea023c84b7c3bea1" }
+source = { git = "https://github.com/PublicQuantumNetwork/pqn-hardware.git?rev=master#d9f46be7df481d11da7acc9a02e9e7eed914f6c6" }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
@@ -765,7 +765,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.14" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "pqn-hardware", git = "https://github.com/PublicQuantumNetwork/pqn-hardware.git?rev=6440be2830fddccb09b461caea023c84b7c3bea1" },
+    { name = "pqn-hardware", git = "https://github.com/PublicQuantumNetwork/pqn-hardware.git?rev=master" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.10.1" },
     { name = "pyserial", specifier = ">=3.5" },

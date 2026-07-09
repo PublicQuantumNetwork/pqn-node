@@ -2,7 +2,6 @@ import concurrent.futures
 import logging
 import time
 from collections.abc import Callable
-from typing import TypeVar
 
 import httpx
 import serial
@@ -27,11 +26,10 @@ _SERIAL_WALL_TIMEOUT_S = 3.0
 _FOLLOWER_TIMEOUT_S = 5.0
 _FOLLOWER_WALL_TIMEOUT_S = 6.0
 
-_T = TypeVar("_T")
 _probe_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
 
 
-def _run_with_timeout(fn: Callable[[], _T], timeout_s: float) -> _T:
+def _run_with_timeout[T](fn: Callable[[], T], timeout_s: float) -> T:
     return _probe_executor.submit(fn).result(timeout=timeout_s)
 
 
@@ -208,9 +206,7 @@ def health() -> HealthStatus:
 
     if follower_node_address:
         try:
-            follower_node = _run_with_timeout(
-                lambda: _probe_follower(follower_node_address), _FOLLOWER_WALL_TIMEOUT_S
-            )
+            follower_node = _run_with_timeout(lambda: _probe_follower(follower_node_address), _FOLLOWER_WALL_TIMEOUT_S)
         except concurrent.futures.TimeoutError:
             follower_node = ComponentStatus(reachable=False, error="timeout")
     else:

@@ -40,7 +40,9 @@ async def measure_correlation(
         channel1=channel1,
         channel2=channel2,
     )
-    client = Client(host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     tagger = cast("TimeTaggerInstrument", client.get_device(settings.timetagger[0], settings.timetagger[1]))
     if tagger is None:
         logger.error("Could not find time tagger device")
@@ -73,7 +75,9 @@ async def count_singles(
             detail="No timetagger configured",
         )
 
-    client = Client(host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     tagger = cast("TimeTaggerInstrument", client.get_device(settings.timetagger[0], settings.timetagger[1]))
     if tagger is None:
         logger.error("Could not find time tagger device")

@@ -46,9 +46,13 @@ async def _qkd(
     if follower_node_address is None:
         follower_node_address = settings.follower_node_address
     if follower_node_address is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
+        )
     logger.debug("Starting QKD")
-    client = Client(host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     hwp = cast("RotatorInstrument", client.get_device(settings.qkd_settings.hwp[0], settings.qkd_settings.hwp[1]))
 
     if hwp is None:
@@ -147,7 +151,9 @@ async def qkd(
 
 @router.post("/single_bit")
 async def request_qkd_single_pass(state: StateDep) -> bool:
-    client = Client(host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000)
+    client = Client(
+        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
+    )
     hwp = cast(
         "RotatorInstrument",
         client.get_device(settings.qkd_settings.request_hwp[0], settings.qkd_settings.request_hwp[1]),
