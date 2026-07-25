@@ -9,8 +9,8 @@ from pqn_node.api.routes import qkd
 from pqn_node.api.routes import rng
 from pqn_node.api.routes import serial
 from pqn_node.api.routes import timetagger
+from pqn_node.api.routes.health import get_effective_availability
 from pqn_node.core.config import GamesAvailability
-from pqn_node.core.config import get_settings
 from pqn_node.core.config import settings
 
 
@@ -31,7 +31,7 @@ api_router.include_router(health.router)
 
 @api_router.get("/games/availability", tags=["games"])
 def get_availability() -> GamesAvailability:
-    return get_settings().games_availability
+    return get_effective_availability()
 
 
 @api_router.get("/node/config", tags=["node"])
