@@ -1,12 +1,12 @@
 import logging
-import tomllib
 from pathlib import Path
 from typing import Annotated
 
-import tomli_w
 import typer
 
+from pqn_node.core.config import config_path
 from pqn_node.core.config import get_settings
+from pqn_node.core.config import write_config
 from pqn_node.cron_manager import describe_schedule
 from pqn_node.cron_manager import get_daily_report_job
 from pqn_node.cron_manager import remove_daily_report_job
@@ -28,12 +28,21 @@ app.add_typer(daily_report_app, name="daily-report")
 def toggle_game(
     games: Annotated[list[str], typer.Argument(help="Games to toggle: chsh, qf, ssm")],
     enable: Annotated[bool, typer.Option("--enable/--disable", help="Enable or disable the games")] = True,  # noqa: FBT002
-    config: Annotated[str, typer.Option(help="Path to config.toml")] = "./config.toml",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            writable=True,
+            help="Path to config.toml [default: the file the node loads]",
+        ),
+    ] = None,
 ) -> None:
     """
     Enable or disable one or more games in config.toml.
 
-    Changes take effect on the next server restart. Games: chsh (Verify Quantum Link), qf (Quantum Fortune), ssm (Share a Secret Message).
+    Changes take effect on the next server restart (or immediately via `PUT /games/availability`
+    on a running Node). Games: chsh (Verify Quantum Link), qf (Quantum Fortune), ssm (Share a Secret Message).
     """
     valid_games = {"chsh", "qf", "ssm"}
     invalid = [g for g in games if g not in valid_games]
@@ -41,16 +50,8 @@ def toggle_game(
         msg = f"Game(s) must be one of: chsh, qf, ssm. Invalid: {invalid}"
         raise typer.BadParameter(msg)
 
-    path = Path(config)
-    with path.open("rb") as f:
-        cfg = tomllib.load(f)
-
-    cfg.setdefault("games_availability", {})
-    for game in games:
-        cfg["games_availability"][game] = enable
-
-    with path.open("wb") as f:
-        tomli_w.dump(cfg, f)
+    path = config if config is not None else config_path()
+    write_config(path, {f"games_availability.{game}": enable for game in games})
 
     status = "enabled" if enable else "disabled"
     logger.info("Games %s %s in %s. Restart the server for changes to take effect.", games, status, path)

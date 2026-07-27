@@ -2,6 +2,8 @@ import concurrent.futures
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from dataclasses import field
 
 import httpx
 import serial
@@ -30,31 +32,7 @@ _FOLLOWER_WALL_TIMEOUT_S = 6.0
 _probe_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
 
 
-class _AvailabilityCache:
-    """Holds what `/games/availability` reports: the last probe's gated result.
-
-    The invariant, which the sticky-availability bug came from violating:
-
-        value == effective_availability(config.toml, most recent probe)
-
-    `value` is a pure function of those two inputs and carries no history. Every
-    probe *overwrites* it with a freshly computed result — the previous value is
-    never read back as an input, so a stale False cannot influence, and cannot
-    survive, the next probe. This is deliberately a cache beside the settings
-    singleton rather than a mutation of it: `settings.games_availability` stays
-    pristine as the configured baseline, because that baseline is what each
-    recomputation starts from. Mutating it in place (as this code once did) makes
-    the output its own next input, which latches the flags off permanently.
-
-    `value` is None until the first probe runs; see `get_effective_availability`.
-    """
-
-    value: GamesAvailability | None = None
-
-
-_availability_cache = _AvailabilityCache()
-
-
+# FIXME: Why does this need to be its own function like this?
 def _run_with_timeout[T](fn: Callable[[], T], timeout_s: float) -> T:
     return _probe_executor.submit(fn).result(timeout=timeout_s)
 
@@ -86,6 +64,33 @@ class HealthStatus(BaseModel):
         if self.rotary_encoder is not None and not self.rotary_encoder.reachable:
             return False
         return not (self.follower_node is not None and not self.follower_node.reachable)
+
+
+@dataclass
+class _LastProbe:
+    """The most recent probe's *inputs* to the availability gate — not its result.
+
+    Holding the inputs is what lets `/games/availability` state, at any moment:
+
+        availability == effective_availability(config.toml, most recent probe)
+
+    Availability is recomputed from the pristine config on every read rather than
+    read back from a stored answer. Two things follow, and both are load-bearing:
+
+    - a gated-off flag can never become an input to the next gating, so it cannot
+      latch games off; they come back on their own once hardware is reachable;
+    - a config change (`PUT /games/availability`) is visible immediately, with no
+      restart and no wait for the next probe.
+
+    `ran` is False until the first probe completes; see `get_effective_availability`.
+    """
+
+    ran: bool = False
+    router: ComponentStatus = field(default_factory=lambda: ComponentStatus(reachable=False, error="no probe yet"))
+    follower_node: ComponentStatus | None = None
+
+
+_last_probe = _LastProbe()
 
 
 def _elapsed_ms(start: float) -> float:
@@ -238,9 +243,11 @@ def health() -> HealthStatus:
     else:
         follower_node = None
 
-    # Refresh what /games/availability reports. Recomputed from the pristine config
-    # (never from the cached value) so games recover once hardware comes back.
-    _availability_cache.value = effective_availability(settings.games_availability, router_status, follower_node)
+    # Record the gate's inputs, not its result: /games/availability recomputes from
+    # the pristine config on every read, so games recover once hardware comes back.
+    _last_probe.router = router_status
+    _last_probe.follower_node = follower_node
+    _last_probe.ran = True
 
     return HealthStatus(
         router=router_status,
@@ -287,16 +294,17 @@ def effective_availability(
 
 
 def get_effective_availability() -> GamesAvailability:
-    """Return the availability computed by the most recent health probe.
+    """Return the current configuration, gated by the most recent health probe.
 
     Backs `GET /games/availability`. Read-only: this does not probe hardware, so
-    the answer is only as fresh as the last `health()` call. Today that means app
-    startup, the daily report, and any manual hit on `/health/` — so hitting
-    `/health/` is what re-enables games on a node whose hardware has recovered.
+    the *hardware* half of the answer is only as fresh as the last `health()`
+    call — app startup, the daily digest, or any manual hit on `/health/`, which
+    is what re-enables games on a Node whose hardware has recovered. The *config*
+    half is always current, so a `PUT /games/availability` shows up here at once.
 
     Falls back to the configured values when no probe has run yet, so the
     endpoint reports config rather than claiming everything is disabled.
     """
-    if _availability_cache.value is None:
+    if not _last_probe.ran:
         return settings.games_availability.model_copy()
-    return _availability_cache.value
+    return effective_availability(settings.games_availability, _last_probe.router, _last_probe.follower_node)

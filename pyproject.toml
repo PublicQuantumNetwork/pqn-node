@@ -22,7 +22,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.10.1",
     "pyserial>=3.5",
-    "tomli-w>=1.0.0",
+    "tomlkit>=0.13.0",
     "typer>=0.15.1",
 ]
 

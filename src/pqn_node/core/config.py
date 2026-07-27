@@ -1,8 +1,14 @@
 import asyncio
 import logging
+import os
+import tempfile
+from collections.abc import Mapping
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
+import tomlkit
 from pqn_hardware.measurement import MeasurementConfig
 from pydantic import BaseModel
 from pydantic import Field
@@ -103,6 +109,88 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def config_path() -> Path:
+    """Return the file the settings above are loaded from."""
+    # pydantic-settings types this as "one path, or a list of them, or None"; ours is one path.
+    return Path(Settings.model_config["toml_file"])  # type: ignore[arg-type]
+
+
+def write_config(path: Path, updates: Mapping[str, Any]) -> None:
+    """Set keys in a config file, applying them to nothing.
+
+    For editing a Node that is not running: the CLI can be pointed at any config file,
+    and a Node need not be started from ``./config.toml``. A running Node calls
+    ``update_config`` instead, so that its live settings match what was written.
+
+    Two guarantees:
+
+    - **Comments survive.** The file keeps its comments, key order, and whitespace;
+      only the named keys change. Operators hand-write ``config.toml`` from a
+      commented example, so a write that reformatted it would destroy their notes.
+    - **The file is never left truncated.** Contents go to a temp file in the same
+      directory and are renamed over the target, which is atomic on POSIX. A crash
+      mid-write leaves the previous config intact.
+
+    Parameters
+    ----------
+    path
+        Config file to write. Created if missing, as are any missing tables in it.
+    updates
+        Dotted key path -> value, e.g. ``{"games_availability.qf": True}``.
+    """
+    document = tomlkit.parse(path.read_text(encoding="utf-8")) if path.exists() else tomlkit.document()
+
+    for dotted_key, value in updates.items():
+        *tables, leaf = dotted_key.split(".")
+        node: Any = document
+        for table in tables:
+            if not isinstance(node.get(table), dict):
+                if len(node) > 0:
+                    node.add(tomlkit.nl())  # keep a new table from being jammed against the previous line
+                node[table] = tomlkit.table()
+            node = node[table]
+        node[leaf] = value
+
+    # Write beside the target and rename over it, which is atomic on POSIX.
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(tomlkit.dumps(document))
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+    logger.info("Updated %s: %s", path, ", ".join(f"{k}={v!r}" for k, v in updates.items()))
+
+
+def update_config(updates: Mapping[str, Any]) -> None:
+    """Set keys in this Node's own config file, and apply them to its live settings.
+
+    The change takes effect immediately, so a running Node picks it up with no restart.
+    Modules import the settings object once and hold it, so it is patched in place
+    rather than rebuilt — replacing it would leave every module on a stale copy.
+
+    Only leaf values are applied, by plain ``setattr``, so callers must pass values
+    that already type-check for the target field — in practice they come from a
+    validated model (see ``PUT /games/availability``).
+
+    Persisting happens first: if the write fails, the in-memory state still matches
+    what is on disk, which is the recoverable direction to fail in.
+    """
+    write_config(config_path(), updates)
+
+    for dotted_key, value in updates.items():
+        *attributes, leaf = dotted_key.split(".")
+        target: Any = settings
+        for attribute in attributes:
+            target = getattr(target, attribute)
+        setattr(target, leaf, value)
 
 
 class NodeRole(Enum):

@@ -104,6 +104,30 @@ uv run fastapi run src/pqn_node/main.py
 
 Browse protocols at http://127.0.0.1:8000/docs.
 
+### Node host provisioning
+
+Two routes under `/system` operate on the host itself and need one-time setup on each Node. Both are used by remote operations tooling; a Node without them still runs every protocol, it just answers those two routes with an error.
+
+**`GET /system/screenshot`** shells out to [`maim`](https://github.com/naelstrof/maim), which writes a PNG of the whole X root window to stdout (so a multi-monitor Node returns all its screens in one image):
+
+```bash
+sudo apt install maim
+```
+
+The API process must be started from inside the desktop session — KDE autostart does this — so that it inherits `DISPLAY`, `XAUTHORITY` and `XDG_RUNTIME_DIR`. Started from a bare SSH shell, capture fails with a 503 rather than returning a black frame.
+
+**`POST /system/reboot`** runs `sudo systemctl reboot`, so the user running the API needs to do that without a password prompt:
+
+```bash
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl reboot" | sudo tee /etc/sudoers.d/pqn-reboot
+sudo chmod 440 /etc/sudoers.d/pqn-reboot
+```
+
+The endpoint returns before the machine goes down, so the caller gets a response and can poll until the Node answers again. Recovery is unattended: on boot the machine autologs in and KDE autostart brings the API, GUI and kiosk back up.
+
+> [!WARNING]
+> Neither route is authenticated, like every other Node API route — Nodes are expected to listen only on their VPN addresses, and membership of that network is the trust boundary. Any member of it can reboot any Node.
+
 ### Daily report
 
 Run or schedule the Slack health-report digest:
