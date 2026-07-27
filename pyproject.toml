@@ -2,6 +2,11 @@
 requires = ["uv_build"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# Two deployables ship from this repo, so both modules must be named; the default is the
+# one module matching the project name, which would silently omit pqn_whobot from a build.
+module-name = ["pqn_node", "pqn_whobot"]
+
 
 [project]
 name = "pqn-node"
@@ -28,6 +33,7 @@ dependencies = [
 
 [project.scripts]
 pqn-node = "pqn_node.cli:app"
+whobot = "pqn_whobot.cli:app"
 
 
 [dependency-groups]
