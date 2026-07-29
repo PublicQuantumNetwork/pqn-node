@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 app = typer.Typer(no_args_is_help=True, help="CLI for Whobot, the PQN Network operations bot.")
 
-_UNKNOWN_NAME = "(unknown)"
-
 
 @app.callback()
 def main() -> None:
@@ -48,13 +46,8 @@ def _load() -> WhobotSettings:
         raise typer.Exit(code=1) from None
 
 
-def _display_name(node: Node) -> str:
-    """Name this Node for the listing, or call it unknown if it never gave one."""
-    return node.name or _UNKNOWN_NAME
-
-
 def _node_line(node: Node, name_width: int) -> str:
-    columns = f"  {_display_name(node):<{name_width}}  {node.api_url}"
+    columns = f"  {node.name:<{name_width}}  {node.api_url}"
     if not node.reachable:
         return f"{columns}  UNREACHABLE — {node.error}"
     latency = f"{node.latency_ms:.0f}ms" if node.latency_ms is not None else "ok"
@@ -71,7 +64,7 @@ def nodes() -> None:
         raise typer.Exit(code=1)
 
     resolved = asyncio.run(resolve_nodes(settings))
-    name_width = max(len(_display_name(node)) for node in resolved)
+    name_width = max(len(node.name) for node in resolved)
     unreachable = [node for node in resolved if not node.reachable]
     warned = [node for node in resolved if node.reachable and node.warning]
 
@@ -88,5 +81,70 @@ def nodes() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command()
+def serve() -> None:
+    """Connect to Slack and stay up, answering /whobot until stopped."""
+    settings = _load()
+
+    missing = [
+        name
+        for name, value in (
+            ("slack_bot_token", settings.slack_bot_token),
+            ("slack_app_token", settings.slack_app_token),
+        )
+        if not value
+    ]
+    if missing:
+        # Socket Mode needs both, and the failure without one is an opaque Slack error, so
+        # it is worth naming exactly which is absent.
+        typer.echo(
+            f"{config_path()} is missing {' and '.join(missing)}. "
+            "See configs/whobot_example.toml for where each token comes from.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if not settings.nodes:
+        typer.echo("Warning: no Nodes registered, so every Node Action will have nothing to offer.", err=True)
+
+    # Imported here rather than at module scope because the Slack libraries are an optional
+    # extra: a Node installs neither, and `whobot nodes` must keep working without them.
+    try:
+        from slack_sdk.errors import SlackApiError  # noqa: PLC0415
+
+        from pqn_whobot.whobot_slack import WhobotSlack  # noqa: PLC0415
+    except ImportError as e:
+        typer.echo(f"Whobot's Slack support is not installed ({e.name}).", err=True)
+        typer.echo("  Install it with: uv sync --extra whobot", err=True)
+        raise typer.Exit(code=1) from None
+
+    bot = WhobotSlack(settings)
+
+    async def run() -> None:
+        # Check the tokens first: start_async retries a rejected one forever rather than
+        # raising, so without this a bad token looks like a bot that started and then
+        # quietly never answered.
+        await bot.check_credentials()
+        typer.echo(f"Connected. {len(settings.nodes)} Node(s) registered. Ctrl-C to stop.")
+        await bot.serve()
+
+    typer.echo("Whobot connecting to Slack…")
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        # asyncio.run has already cancelled the loop; serve's finally block reported any
+        # Action that was interrupted, so there is nothing to add but a clean exit.
+        typer.echo("Stopped.")
+    except SlackApiError as e:
+        error = e.response.get("error", "unknown")
+        typer.echo(f"Slack rejected Whobot's credentials: {error}.", err=True)
+        typer.echo(
+            "  slack_bot_token is the 'xoxb-' Bot User OAuth token (OAuth & Permissions).\n"
+            "  slack_app_token is the 'xapp-' app-level token with connections:write (Socket Mode).",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+
 if __name__ == "__main__":
-    app()
+    app(["serve"])

@@ -25,10 +25,9 @@ api_url = "http://offline.invalid:9000"
 """
 
 ALIVE = Node(api_url="http://node-a.invalid:9000", name="uiuc-public-left", reachable=True, latency_ms=12.3)
-DEAD = Node(api_url="http://offline.invalid:9000", name=None, reachable=False, error="ConnectError: refused")
+DEAD = Node(api_url="http://offline.invalid:9000", reachable=False, error="ConnectError: refused")
 OUTDATED = Node(
     api_url="http://node-b.invalid:9000",
-    name=None,
     reachable=True,
     warning="no node_name in /node/config; the Node is running older code — update it",
     latency_ms=8.0,

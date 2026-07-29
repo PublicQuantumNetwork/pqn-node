@@ -60,6 +60,10 @@ class WhobotSettings(BaseSettings):
     # Bound for a single "are you there?" call, well under the digest's per-Node budget.
     reachability_timeout_s: float = Field(default=5.0, gt=0)
 
+    # Bound for one Node API call made by an Action. Neither existing key fits: 5s is for
+    # "are you there?", and 900s is the digest's whole budget for a Node.
+    node_timeout_s: float = Field(default=30.0, gt=0)
+
     # What a digest run records about itself.
     last_run_at: datetime | None = None
     last_result: str | None = None

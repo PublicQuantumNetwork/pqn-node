@@ -31,13 +31,27 @@ dependencies = [
     "typer>=0.15.1",
 ]
 
+[project.optional-dependencies]
+# Whobot's Chat Platform transport. Every Node ships Whobot's code but never runs it, so
+# these stay out of the base dependencies and a Node deployment does not install them.
+# Whobot's host installs them with `uv sync --extra whobot`; `whobot nodes` needs neither.
+# aiohttp is explicit because slack-bolt's `[async]` extra was removed in 1.30, and async
+# Socket Mode still needs it.
+whobot = [
+    "slack-bolt>=1.18",
+    "aiohttp>=3.9",
+]
+
 [project.scripts]
 pqn-node = "pqn_node.cli:app"
 whobot = "pqn_whobot.cli:app"
 
 
 [dependency-groups]
-dev = ["hypothesis", "mypy", "coverage", "pytest-randomly", "ruff"]
+# The whobot extra is pulled in here so the Slack tests run with a plain `uv run pytest`.
+# It stays an extra rather than a dev dependency because a Whobot host needs it in
+# production, where dev groups are not installed.
+dev = ["hypothesis", "mypy", "coverage", "pytest-randomly", "ruff", "pqn-node[whobot]"]
 
 
 [tool.mypy]
@@ -83,7 +97,8 @@ extend-ignore = [
 
 [tool.ruff.lint.extend-per-file-ignores]
 "tests/*" = [
-    "S101", # Assert
+    "S101",   # Assert
+    "ARG002", # A test double exists to have a signature, not to use every argument in it.
 ]
 # Run pytest lint rules only in test files.
 "!tests/*" = ["PT"]

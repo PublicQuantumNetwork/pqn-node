@@ -15,6 +15,7 @@ import pytest
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
+from pqn_whobot.registry import UNKNOWN_NAME
 from pqn_whobot.registry import Node
 from pqn_whobot.registry import resolve_node
 from pqn_whobot.registry import resolve_nodes
@@ -86,11 +87,11 @@ def test_registry_order_is_preserved() -> None:
 
 
 def test_an_unreachable_node_has_no_name() -> None:
-    """A Node that won't answer never said what it is called."""
+    """A Node that won't answer never said what it is called, so it is called unknown."""
     resolved = resolve_all(settings_for(DEAD), node_api(_by_name))
 
     assert resolved[0].reachable is False
-    assert resolved[0].name is None
+    assert resolved[0].name == UNKNOWN_NAME
     assert resolved[0].error is not None
     assert "ConnectError" in resolved[0].error
 
@@ -99,7 +100,7 @@ def test_one_dead_node_does_not_hide_the_healthy_ones() -> None:
     resolved = resolve_all(settings_for(ALICE, DEAD, BOB), node_api(_by_name))
 
     assert [node.reachable for node in resolved] == [True, False, True]
-    assert [node.name for node in resolved] == ["uiuc-public-left", None, "ufl-public-right"]
+    assert [node.name for node in resolved] == ["uiuc-public-left", UNKNOWN_NAME, "ufl-public-right"]
 
 
 def test_an_empty_registry_resolves_to_nothing() -> None:
@@ -134,7 +135,7 @@ def test_a_node_without_node_name_is_reachable_but_warned() -> None:
 
     assert resolved[0].reachable is True
     assert resolved[0].error is None
-    assert resolved[0].name is None
+    assert resolved[0].name == UNKNOWN_NAME
     assert resolved[0].warning is not None
     assert "node_name" in resolved[0].warning
 

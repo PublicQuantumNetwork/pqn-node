@@ -1,4 +1,4 @@
-"""Whobot — the operations bot for a PQN Network. See ``WHOBOT.md``.
+"""Whobot — the operations bot for a PQN Network.
 
 One Whobot instance serves many Nodes: it posts the scheduled Daily Digest and lets an
 operator probe and control any Node from a chat platform.
