@@ -4,15 +4,19 @@ Whobot reads `./whobot.toml`, so each test runs in a temp directory holding one.
 """
 
 import tomllib
+from datetime import UTC
+from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from pqn_whobot.config import ConfigWriteError
 from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.config import config_path
+from pqn_whobot.config import update_config
 
 EXAMPLE_CONFIG = """\
 # Slack credentials.
@@ -207,3 +211,123 @@ def test_the_mutable_fields_round_trip_from_the_file(tmp_path: Path) -> None:
     assert settings.last_result == "ok"
     assert settings.last_run_at is not None
     assert settings.last_run_at.utcoffset() == timedelta(hours=-6)
+
+
+# --------------------------------------------------------------------------------------
+# Writing back. `write_config`'s own guarantees — atomic rename, no stray temp file — are
+# `pqn_node`'s and are tested in `test_config_updates.py`.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_persisted_schedule_survives_a_reload(config_file: Path) -> None:
+    settings = WhobotSettings()
+
+    update_config(settings, {"schedule_hour": 9, "schedule_minute": 30})
+
+    reloaded = WhobotSettings()
+    assert (reloaded.schedule_hour, reloaded.schedule_minute) == (9, 30)
+    assert config_file.read_text(encoding="utf-8").count("schedule_hour") == 1
+
+
+def test_a_write_applies_to_the_live_settings_object(config_file: Path) -> None:
+    """No restart: the loop re-reads this object every tick, so it re-arms itself."""
+    settings = WhobotSettings()
+    assert settings.schedule_hour == 7  # noqa: PLR2004 - the value in EXAMPLE_CONFIG
+
+    update_config(settings, {"schedule_hour": 9})
+
+    assert settings.schedule_hour == 9  # noqa: PLR2004 - and the file agrees
+    assert "schedule_hour = 9" in config_file.read_text(encoding="utf-8")
+
+
+def test_the_comments_and_the_tokens_survive_a_write(config_file: Path) -> None:
+    """Operators hand-write this file from a commented example, and it holds the tokens."""
+    update_config(WhobotSettings(), {"schedule_hour": 9})
+
+    written = config_file.read_text(encoding="utf-8")
+    assert "# Slack credentials." in written
+    assert "schedule_hour = 9  # morning digest" in written
+    assert 'slack_app_token = "xapp-secret"' in written
+    assert "# The Node Registry." in written
+    assert [node.api_url for node in WhobotSettings().nodes] == [
+        "http://node-a.invalid:9000",
+        "http://node-b.invalid:9000",
+    ]
+
+
+def test_what_a_run_recorded_round_trips(config_file: Path) -> None:
+    """A digest writes an aware instant as a TOML timestamp and reads back the same instant.
+
+    Both keys are absent until the first run writes them, and `[[nodes]]` is last in the file —
+    so a key appended in the wrong place lands inside it and takes the registry with it.
+    """
+    ran_at = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+
+    update_config(WhobotSettings(), {"last_run_at": ran_at, "last_result": "ok — 2 of 2 Nodes reported no problems"})
+
+    reloaded = WhobotSettings()
+    assert reloaded.last_run_at == ran_at
+    assert reloaded.last_result == "ok — 2 of 2 Nodes reported no problems"
+    assert len(reloaded.nodes) == 2  # noqa: PLR2004 - both registry entries, still where they were
+
+    written = config_file.read_text(encoding="utf-8")
+    assert "# Slack credentials." in written
+    # A quoted string would reload as a `datetime` too, so the round trip alone does not
+    # prove the file is readable by anything else that parses TOML.
+    assert "last_run_at = 2026-07-29T12:00:00Z" in written
+    assert written.index("last_run_at") < written.index("[[nodes]]")
+
+
+def test_an_unknown_key_is_refused_before_the_file_is_touched(config_file: Path) -> None:
+    """A typo would write a key that `extra="forbid"` then refuses on the next start: the
+    bot keeps running and cannot come back up."""  # noqa: D205, D209
+    before = config_file.read_text(encoding="utf-8")
+
+    with pytest.raises(KeyError, match="schedule_hours"):
+        update_config(WhobotSettings(), {"schedule_hours": 9})
+
+    assert config_file.read_text(encoding="utf-8") == before
+
+
+MUTABLE_KEY_BELOW_THE_REGISTRY = """\
+slack_bot_token = "xoxb-secret"
+
+[[nodes]]
+api_url = "http://node-a.invalid:9000"
+
+last_result = "ok"
+"""
+"""A hand-edited file with `last_result` after the table, so TOML reads it as that Node's.
+
+`tomlkit` cannot see it there, so a write adds a second one at the top and leaves this behind —
+and `extra="forbid"` then refuses the file, which is what `update_config` must not allow.
+"""
+
+
+def test_a_write_is_rolled_back_when_the_file_does_not_load(config_file: Path) -> None:
+    """The real timeline: Whobot is running, the file is hand-edited under it, then a digest writes.
+
+    Whobot cannot mend the file, but it must not leave a *different* broken file behind, and it
+    must not report a run it could not record.
+    """
+    settings = WhobotSettings()  # loaded while the file was still good
+    config_file.write_text(MUTABLE_KEY_BELOW_THE_REGISTRY, encoding="utf-8")
+
+    with pytest.raises(ConfigWriteError, match="does not load"):
+        update_config(settings, {"last_result": "warn"})
+
+    assert config_file.read_text(encoding="utf-8") == MUTABLE_KEY_BELOW_THE_REGISTRY
+    assert list(config_file.parent.iterdir()) == [config_file], "no temp file left behind"
+    # Memory and disk still agree, which is the point of writing before applying.
+    assert settings.last_result is None
+
+
+def test_a_rolled_back_write_names_the_likely_cause(config_file: Path) -> None:
+    """Whoever reads this has to know where to look; pydantic's dump alone does not say."""
+    settings = WhobotSettings()
+    config_file.write_text(MUTABLE_KEY_BELOW_THE_REGISTRY, encoding="utf-8")
+
+    with pytest.raises(ConfigWriteError, match=r"move it above"):
+        update_config(settings, {"schedule_hour": 9})
+
+    assert settings.schedule_hour == 7  # noqa: PLR2004 - the default, unchanged

@@ -18,14 +18,18 @@
 #
 #   Socket Mode           toggle on, generate an app-level token with `connections:write`.
 #                         That token is slack_app_token, and starts with "xapp-".
-#   OAuth & Permissions   bot token scopes `chat:write`, `commands`, `files:write` (the
-#                         last is for screenshot upload). Install to the workspace. That
-#                         token is slack_bot_token, and starts with "xoxb-".
+#   OAuth & Permissions   bot token scopes `chat:write`, `commands`, `files:write` (for the
+#                         screenshot upload) and `channels:read` — NOT `channels:history`,
+#                         which sits next to it and does not work: Whobot never reads
+#                         messages, it checks that digest_channel exists and that it is in
+#                         it. Add `groups:read` too if the digest goes to a private channel.
+#                         Install to the workspace. That token is slack_bot_token, "xoxb-".
 #   Slash Commands        create /whobot. No Request URL is needed under Socket Mode.
 #   Interactivity         toggle on. Again no Request URL.
 #
 # Finally invite the bot to the channel the digest goes to, and put that channel's ID in
-# digest_channel below.
+# digest_channel below — `whobot serve` refuses to start until both are true, since otherwise
+# the first sign of trouble is a digest that silently never arrives.
 slack_bot_token = "xoxb-..."
 slack_app_token = "xapp-..."
 digest_channel = "C0123456789"  # channel ID the Daily Digest is posted to
@@ -69,6 +73,13 @@ reboot_wait_s = 300
 # Leave it out in production.
 # debug_screenshot_path = "/path/to/some-image.png"
 
+# Whobot writes these two back itself after each digest run; leave them out of a fresh file.
+# They must stay ABOVE the [[nodes]] tables below. A plain key written after a table belongs to
+# that table, so moving these to the end of the file makes them fields of the last Node, and
+# Whobot then refuses to start.
+# last_run_at = 2026-01-01T07:00:00-06:00
+# last_result = "ok"
+
 # The Node Registry. Whobot knows about exactly these Nodes — adding one is an edit here,
 # not a code change. Use each Node's address on the VPN; production Nodes listen on 9000.
 # Node *names* are deliberately not listed: Whobot reads them from each Node's
@@ -78,7 +89,3 @@ api_url = "http://xx.xx.xx.xx:9000"
 
 [[nodes]]
 api_url = "http://xx.xx.xx.xx:9000"
-
-# Whobot writes these back itself after each digest run; leave them out of a fresh file.
-# last_run_at = 2026-01-01T07:00:00-06:00
-# last_result = "ok"

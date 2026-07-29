@@ -15,17 +15,22 @@ because dispatch consults the registry over HTTP on every ``scope=ONE`` click.
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from datetime import UTC
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
@@ -44,6 +49,7 @@ from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
+from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeClient
 from pqn_whobot.registry import Node
 from pqn_whobot.whobot import GAME_TITLES
@@ -60,6 +66,9 @@ REACHABLE = [
     Node(api_url=ALICE, name="uiuc-public-left", reachable=True, latency_ms=18.0),
     Node(api_url=BOB, name="ufl-public-right", reachable=True, latency_ms=24.0),
 ]
+
+SCHEDULED = ReplyHandle()
+"""Stands in for the digest channel: what a run nobody clicked for is handed."""
 
 DISTINCT_FAILURE_MODES = 3
 """Raising, timing out and being interrupted: three failures an operator must tell apart."""
@@ -83,6 +92,7 @@ class Drawn:
     initial: dict[str, object] = field(default_factory=dict)
     notes: list[str | None] = field(default_factory=list)
     results: list[ActionResult] = field(default_factory=list)
+    replies: list[ReplyHandle] = field(default_factory=list)
 
 
 class WhobotSpy(Whobot):
@@ -120,6 +130,10 @@ class WhobotSpy(Whobot):
     async def post_result(self, act: Action, result: ActionResult, reply: ReplyHandle) -> None:
         self.drawn.calls.append("post_result")
         self.drawn.results.append(result)
+        self.drawn.replies.append(reply)
+
+    def scheduled_handle(self) -> ReplyHandle:
+        return SCHEDULED
 
 
 class FlowSpy(WhobotSpy):
@@ -1285,3 +1299,287 @@ def test_the_digests_budget_grows_with_the_registry() -> None:
 
 def test_the_digests_output_carries_no_platform_markup() -> None:
     assert_no_markup(checked(with_node_api(node_api(), ALICE, BOB), "run_digest"))
+
+
+# --------------------------------------------------------------------------------------
+# The scheduler. The clock is faked and the tick shortened, so nothing here waits on a
+# real one. No Node is registered either: the digest's *content* is tested above, and an
+# empty registry answers without touching the network.
+# --------------------------------------------------------------------------------------
+
+CHICAGO = ZoneInfo("America/Chicago")
+SETTLE_S = 0.05
+"""Long enough for many ticks at the shortened interval below."""
+
+
+@dataclass
+class FakeClock:
+    """A clock the test moves by hand, standing in for the `datetime` the loop reads."""
+
+    at: datetime
+
+    def now(self, _tz: object = None) -> datetime:
+        return self.at
+
+
+def scheduled_bot(clock: FakeClock, monkeypatch: pytest.MonkeyPatch, **overrides: object) -> FlowSpy:
+    monkeypatch.setattr("pqn_whobot.whobot.datetime", clock)
+    monkeypatch.setattr("pqn_whobot.whobot.SCHEDULER_TICK_S", 0.005)
+    return FlowSpy(settings_for(digest_channel="C0DIGEST", **overrides))
+
+
+async def settle() -> None:
+    await asyncio.sleep(SETTLE_S)
+
+
+def test_a_scheduled_digest_posts_one_message_and_never_announces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ack to reply under: nobody clicked, so there is nobody waiting to read one."""
+    bot = scheduled_bot(FakeClock(at=datetime(2026, 7, 29, 7, 0, tzinfo=CHICAGO)), monkeypatch)
+
+    asyncio.run(bot._run_scheduled_digest())  # noqa: SLF001 - the loop's one step, without the waiting
+
+    assert bot.drawn.calls == ["post_result"]
+    assert bot.drawn.replies == [SCHEDULED]
+
+
+def test_a_scheduled_digest_records_what_it_did(monkeypatch: pytest.MonkeyPatch) -> None:
+    ran_at = datetime(2026, 7, 29, 7, 0, tzinfo=CHICAGO)
+    bot = scheduled_bot(FakeClock(at=ran_at), monkeypatch)
+
+    asyncio.run(bot._run_scheduled_digest())  # noqa: SLF001
+
+    assert bot.settings.last_run_at == ran_at
+    reloaded = WhobotSettings()
+    assert reloaded.last_run_at == ran_at
+    assert reloaded.last_result is not None
+    assert reloaded.last_result.startswith("warn")
+
+
+def test_a_missed_run_is_not_replayed_on_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whobot starting at 08:00 does not run the 07:00 digest it was down for."""
+    clock = FakeClock(at=datetime(2026, 7, 29, 8, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7, last_run_at=datetime(2026, 7, 20, 12, 0, tzinfo=UTC))
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+
+    asyncio.run(go())
+
+    assert bot.drawn.calls == []
+
+
+def test_a_run_fires_when_its_time_arrives(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 6, 59, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()
+        assert bot.drawn.calls == []  # not yet due
+        clock.at = datetime(2026, 7, 29, 7, 0, 1, tzinfo=CHICAGO)
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+
+    asyncio.run(go())
+
+    # Once, and once only: after firing, the next target is tomorrow.
+    assert bot.drawn.calls == ["post_result"]
+
+
+def test_a_changed_schedule_rearms_without_a_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 6, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()
+
+        update_config(bot.settings, {"schedule_hour": 6, "schedule_minute": 30})
+        await settle()  # the loop notices and re-arms for 06:30 while it is still 06:00
+
+        clock.at = datetime(2026, 7, 29, 6, 31, tzinfo=CHICAGO)
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+
+    asyncio.run(go())
+
+    # Nothing fires at 06:31 unless the running loop moved its target off 07:00.
+    assert bot.drawn.calls == ["post_result"]
+
+
+def test_a_digest_that_cannot_be_posted_does_not_stop_tomorrows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one thing that must not happen quietly: the loop dying and no digest ever again."""
+    clock = FakeClock(at=datetime(2026, 7, 29, 6, 59, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+    attempts = 0
+
+    async def refuse(*_: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        msg = "Slack said no"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(bot, "post_result", refuse)
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()  # let it arm for 07:00 today; a spawned task runs nothing until awaited
+        clock.at = datetime(2026, 7, 29, 7, 0, 1, tzinfo=CHICAGO)
+        await settle()
+        clock.at = datetime(2026, 7, 30, 7, 0, 1, tzinfo=CHICAGO)
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+
+    asyncio.run(go())
+
+    assert attempts == 2  # noqa: PLR2004 - today's and tomorrow's, so the loop outlived the failure
+    # And a digest nobody could be told about is not recorded, so it still reads as missed.
+    assert WhobotSettings().last_run_at is None
+
+
+def test_shutdown_stops_the_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 6, 59, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+        clock.at = datetime(2026, 7, 29, 7, 0, 1, tzinfo=CHICAGO)
+        await settle()
+
+    asyncio.run(go())
+
+    assert bot.drawn.calls == []
+
+
+def test_no_digest_channel_means_no_scheduled_digest(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Said out loud, because the alternative is a bot that silently never reports."""
+    clock = FakeClock(at=datetime(2026, 7, 29, 7, 0, 1, tzinfo=CHICAGO))
+    monkeypatch.setattr("pqn_whobot.whobot.datetime", clock)
+    monkeypatch.setattr("pqn_whobot.whobot.SCHEDULER_TICK_S", 0.005)
+    bot = FlowSpy(settings_for(schedule_hour=7))
+
+    async def go() -> None:
+        bot.start_scheduler()
+        await settle()
+        await bot.shutdown(grace_s=1.0)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(go())
+
+    assert bot.drawn.calls == []
+    assert "digest_channel" in caplog.text
+
+
+# --------------------------------------------------------------------------------------
+# The two schedule Actions.
+# --------------------------------------------------------------------------------------
+
+
+def fields_of(report: Report) -> dict[str, str]:
+    return {f.name: f.value for f in report.sections[0].fields}
+
+
+def test_digest_status_reports_a_run_that_happened(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(
+        clock, monkeypatch, schedule_hour=7, last_run_at=datetime(2026, 7, 29, 7, 0, tzinfo=CHICAGO), last_result="ok"
+    )
+
+    async def go() -> Report:
+        bot.start_scheduler()
+        report = await bot.digest_status()
+        await bot.shutdown(grace_s=1.0)
+        return report
+
+    report = asyncio.run(go())
+
+    assert report.status is Status.OK
+    assert report.notes == []
+    assert report.summary == "Scheduled for 07:00 America/Chicago."
+    # Every time an operator is shown is in the digest's zone, never the host's.
+    assert fields_of(report) == {
+        "Next run": "2026-07-30 07:00 CDT",
+        "Last run": "2026-07-29 07:00 CDT",
+        "Last result": "ok",
+    }
+
+
+def test_digest_status_reports_a_missed_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Derived from the two timestamps: nothing records that a run was skipped."""
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7, last_run_at=datetime(2026, 7, 27, 12, 0, tzinfo=UTC))
+
+    async def go() -> Report:
+        bot.start_scheduler()
+        report = await bot.digest_status()
+        await bot.shutdown(grace_s=1.0)
+        return report
+
+    report = asyncio.run(go())
+
+    assert report.status is Status.WARN
+    assert report.notes == ["The 2026-07-29 07:00 CDT run did not happen; a missed run is never replayed."]
+
+
+def test_digest_status_says_when_nothing_is_scheduled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bot with no digest_channel has no scheduler, and must not look healthy."""
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    monkeypatch.setattr("pqn_whobot.whobot.datetime", clock)
+    bot = FlowSpy(settings_for(schedule_hour=7))
+
+    report = asyncio.run(bot.digest_status())
+
+    assert report.status is Status.WARN
+    assert fields_of(report)["Last run"] == "never"
+    assert fields_of(report)["Last result"] == "nothing recorded"
+    assert "no digest_channel" in report.notes[0]
+
+
+def test_changing_the_schedule_persists_and_says_when_it_next_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+
+    report = asyncio.run(bot.set_digest_schedule(hour=21, minute=15))
+
+    assert report.status is Status.OK
+    assert report.summary == "Scheduled for 21:15 America/Chicago, was 07:00 America/Chicago."
+    assert fields_of(report) == {"Next run": "2026-07-29 21:15 CDT"}
+    assert (bot.settings.schedule_hour, bot.settings.schedule_minute) == (21, 15)
+    assert WhobotSettings().schedule_hour == 21  # noqa: PLR2004 - and it survives a restart
+
+
+def test_the_schedule_form_opens_on_the_schedule_in_force(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=21, schedule_minute=15)
+
+    run(bot, PendingInvocation(action="set_digest_schedule"))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert bot.drawn.initial == {"hour": 21, "minute": 15}
+
+
+@pytest.mark.parametrize(("hour", "minute"), [(24, 0), (-1, 0), (7, 60), (7, -1)])
+def test_the_schedule_action_refuses_what_the_config_would(
+    monkeypatch: pytest.MonkeyPatch, hour: int, minute: int
+) -> None:
+    """Two places state what a time of day is, so this keeps them from drifting apart.
+
+    The Action must refuse anything ``WhobotSettings`` would, or the write succeeds and Whobot
+    cannot load its own config on the next start.
+    """
+    clock = FakeClock(at=datetime(2026, 7, 29, 9, 0, tzinfo=CHICAGO))
+    bot = scheduled_bot(clock, monkeypatch, schedule_hour=7)
+
+    report = asyncio.run(bot.set_digest_schedule(hour=hour, minute=minute))
+
+    with pytest.raises(ValidationError):
+        WhobotSettings(schedule_hour=hour, schedule_minute=minute)
+    assert report.status is Status.FAIL
+    assert (bot.settings.schedule_hour, bot.settings.schedule_minute) == (7, 0)
+    assert not Path("whobot.toml").exists(), "a refused schedule must not touch the file"

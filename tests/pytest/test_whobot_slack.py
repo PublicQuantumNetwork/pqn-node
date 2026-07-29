@@ -6,11 +6,13 @@ limits that produce useless errors when breached — a 75-character option value
 to a section — and the two rendering rules that come from the data rather than from a flag.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
@@ -363,6 +365,10 @@ def chsh_action() -> Any:
     return scan_actions(WhobotSlack)["run_chsh"]
 
 
+def schedule_action() -> Any:
+    return scan_actions(WhobotSlack)["set_digest_schedule"]
+
+
 def checkboxes(act: Any, initial: dict[str, object]) -> Block:
     return next(b for b in WhobotSlack._form_blocks(act, initial) if b["block_id"] == PARAMS_BLOCK)  # noqa: SLF001
 
@@ -393,6 +399,25 @@ def test_a_float_parameter_becomes_a_number_input() -> None:
     assert [b["element"]["initial_value"] for b in blocks] == ["11.0", "33.5"]
     assert all(b["element"]["is_decimal_allowed"] for b in blocks), "angles are not whole degrees"
     assert [b["label"]["text"] for b in blocks] == ["Angle A", "Angle B"]
+
+
+def test_an_int_parameter_becomes_a_number_input_that_refuses_decimals() -> None:
+    """The third widget mapping. An hour of the day has no decimals, so the widget says so."""
+    blocks = WhobotSlack._form_blocks(schedule_action(), {"hour": 21, "minute": 15})  # noqa: SLF001
+
+    assert [b["element"]["type"] for b in blocks] == ["number_input", "number_input"]
+    assert [b["element"]["initial_value"] for b in blocks] == ["21", "15"]
+    assert not any(b["element"]["is_decimal_allowed"] for b in blocks), "07:30 is not half past seven"
+
+
+def test_an_int_number_input_reads_back_as_an_int() -> None:
+    act = schedule_action()
+    state = {
+        _param_block("hour"): {_param_block("hour"): {"type": "number_input", "value": "21"}},
+        _param_block("minute"): {_param_block("minute"): {"type": "number_input", "value": "15"}},
+    }
+
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"hour": 21, "minute": 15}  # noqa: SLF001
 
 
 def test_an_action_with_no_booleans_renders_no_checkbox_group() -> None:
@@ -478,3 +503,83 @@ def test_targets_are_labelled_with_both_name_and_address() -> None:
 
     assert _target_label(Node(api_url=ALICE, name="uiuc-public-left", reachable=True)) == f"uiuc-public-left — {ALICE}"
     assert _target_label(Node(api_url=ALICE, reachable=False)) == f"(unknown) — {ALICE}"
+
+
+# --------------------------------------------------------------------------------------
+# The digest channel preflight. Same reasoning as the token preflight: a wrong channel is
+# a bot that starts, looks healthy, and posts nothing at 07:00 the next morning.
+# --------------------------------------------------------------------------------------
+
+
+def answering_conversations_info(bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch, response: Any) -> None:
+    """Answer `conversations.info` with a canned response, or raise a canned Slack error."""
+
+    async def info(*, channel: str) -> Any:  # noqa: ARG001
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(bot.app.client, "conversations_info", info)
+
+
+def slack_error(error: str, **extra: str) -> SlackApiError:
+    return SlackApiError(message=error, response={"ok": False, "error": error, **extra})
+
+
+def bot_for(channel: str) -> WhobotSlack:
+    return WhobotSlack(WhobotSettings(slack_bot_token="xoxb-not-a-real-token", digest_channel=channel))  # noqa: S106
+
+
+def test_a_channel_whobot_is_in_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = bot_for("C0BLCR837LJ")
+    answering_conversations_info(bot, monkeypatch, {"channel": {"name": "pqn-ops", "is_member": True}})
+
+    assert asyncio.run(bot.check_digest_channel()) is None
+
+
+def test_a_channel_id_that_does_not_exist_is_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The example config ships a placeholder ID, so this is the likeliest way to get it wrong."""
+    bot = bot_for("C0123456789")
+    answering_conversations_info(bot, monkeypatch, slack_error("channel_not_found"))
+
+    problem = asyncio.run(bot.check_digest_channel())
+
+    assert problem is not None
+    assert "C0123456789" in problem
+    assert "channel_not_found" in problem
+
+
+def test_a_channel_whobot_is_not_in_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`chat:write` alone cannot post to a channel the bot has not been invited to."""
+    bot = bot_for("C0BLCR837LJ")
+    answering_conversations_info(bot, monkeypatch, {"channel": {"name": "pqn-ops", "is_member": False}})
+
+    problem = asyncio.run(bot.check_digest_channel())
+
+    assert problem is not None
+    assert "#pqn-ops" in problem
+
+
+def test_a_token_that_cannot_look_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check that can be skipped is a check nobody has, so an unverifiable channel stops the bot.
+
+    The message has to name the scope and the reinstall, because that is the whole remedy.
+    """
+    bot = bot_for("C0BLCR837LJ")
+    answering_conversations_info(bot, monkeypatch, slack_error("missing_scope", provided="channels:history,chat:write"))
+
+    problem = asyncio.run(bot.check_digest_channel())
+
+    assert problem is not None
+    assert "channels:read" in problem
+    assert "Reinstall" in problem
+    # Quoting the granted scopes back is what tells `channels:history` from `channels:read`.
+    assert "channels:history,chat:write" in problem
+
+
+def test_no_digest_channel_is_not_a_problem_to_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leaving it unset turns the scheduled digest off, which start_scheduler already says."""
+    bot = bot_for("")
+    answering_conversations_info(bot, monkeypatch, slack_error("channel_not_found"))
+
+    assert asyncio.run(bot.check_digest_channel()) is None

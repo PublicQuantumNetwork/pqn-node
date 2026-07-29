@@ -208,8 +208,9 @@ Resolved by ``Action.timeout_for`` at call time, which is the only moment the nu
 the scan stores the declaration and never looks inside it.
 """
 
-WIDGET_TYPES: tuple[type, ...] = (bool, float)
-"""Parameter types the form generator can render: ``bool`` a checkbox, ``float`` a number input.
+WIDGET_TYPES: tuple[type, ...] = (bool, float, int)
+"""Parameter types the form generator can render: ``bool`` a checkbox, ``float`` and ``int`` a
+number input — which for an ``int`` refuses decimals, since an hour of the day has none.
 
 The scan rejects any other type by name, so an unsupported parameter fails at import with a
 message rather than producing an empty form. Adding ``str`` or ``Literal``/enum is one entry

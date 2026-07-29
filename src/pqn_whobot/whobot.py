@@ -23,8 +23,8 @@ the ``timeout_s`` bounding the whole invocation. The signature says the rest.
 ``scope=Scope.ONE`` means the Action acts on one Node, which the operator picks and which
 arrives as the method's first argument; ``Scope.NONE`` means it acts on the Network and
 takes no Node. Every remaining parameter is keyword-only and becomes a question in the
-parameter form: a checkbox per ``bool`` and a number input per ``float``, which are the only
-widget mappings there are.
+parameter form: a checkbox per ``bool`` and a number input per ``float`` or ``int``, which are
+the only widget mappings there are.
 
 An Action returns an ``ActionResult``, usually a ``Report``, describing *what happened*. It
 must not emit platform markup: deciding what a result looks like belongs to the subclass,
@@ -69,10 +69,11 @@ an operator unable to tell whether the work happened.
 What a Chat Platform implements
 -------------------------------
 
-Six abstract methods: the four steps that can be asked for — ``show_menu``,
-``ask_for_target``, ``ask_for_params``, ``ask_to_confirm`` — and the two halves of a run,
-``announce_start`` and ``post_result``. A subclass implements those and nothing else. It
-declares no Actions today, though the scan runs on every subclass and would find any it did.
+Seven abstract methods: the four steps that can be asked for — ``show_menu``,
+``ask_for_target``, ``ask_for_params``, ``ask_to_confirm`` — the two halves of a run,
+``announce_start`` and ``post_result``, and ``scheduled_handle``, which says where a run
+nobody clicked for is posted. A subclass implements those and nothing else. It declares no
+Actions today, though the scan runs on every subclass and would find any it did.
 
 This module must not reference a Chat Platform.
 """
@@ -83,9 +84,12 @@ import time
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Coroutine
+from datetime import UTC
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from typing import ClassVar
+from zoneinfo import ZoneInfo
 
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
@@ -104,12 +108,15 @@ from pqn_whobot.actions import Status
 from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
+from pqn_whobot.config import ConfigWriteError
 from pqn_whobot.config import WhobotSettings
+from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
 from pqn_whobot.registry import UNKNOWN_NAME
 from pqn_whobot.registry import Node
 from pqn_whobot.registry import resolve_nodes
+from pqn_whobot.schedule import Schedule
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +135,13 @@ that is about to die and reports a machine that never went away."""
 
 REBOOT_POLL_INTERVAL_S = 5.0
 """How often a rebooting Node is asked whether it is back."""
+
+SCHEDULER_TICK_S = 60.0
+"""Longest one tick of the scheduler sleeps.
+
+Capped rather than sleeping straight to the next run, so a schedule changed from a Chat
+Platform re-arms on its own and a suspended host cannot wake up still asleep past a fire
+time. When the target is nearer than this, the tick sleeps exactly as long as is left."""
 
 
 def one_game_budget(settings: WhobotSettings) -> float:
@@ -158,6 +172,10 @@ def one_node_budget(settings: WhobotSettings) -> float:
     """
     return 2 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
 
+
+SCHEDULE_BOUNDS = {"hour": (0, 23), "minute": (0, 59)}
+"""What counts as a time of day. ``WhobotSettings`` declares the same bounds on its own fields,
+and ``test_the_schedule_action_refuses_what_the_config_would`` keeps the two in step."""
 
 DIGEST_TITLE = "Daily Digest"
 """What the fleet-wide report is called, whether it was scheduled or asked for by hand."""
@@ -197,9 +215,10 @@ class Whobot(ABC):
 
     def __init__(self, settings: WhobotSettings) -> None:
         self.settings = settings
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._tasks: set[asyncio.Task[object]] = set()
         # Interruption replies, which must survive the cancellation that caused them.
         self._finalisers: set[asyncio.Task[None]] = set()
+        self._scheduler: asyncio.Task[None] | None = None
         self._accepting = True
 
     # ----------------------------------------------------------------------------------
@@ -410,6 +429,87 @@ class Whobot(ABC):
             summary=f"{healthy} of {len(digests)} Nodes reported no problems",
             nodes=digests,
         )
+
+    @action(label="Digest status", description="When the Daily Digest last ran, and when it runs next.")
+    async def digest_status(self) -> Report:
+        """Report the schedule, the next run, and what the last one did.
+
+        Overdue is derived rather than stored: the last recorded run being older than the most
+        recent scheduled one means at least one was missed.
+        """
+        schedule = Schedule.from_settings(self.settings)
+        now = datetime.now(UTC)
+        due, last_run_at = schedule.previous_at_or_before(now), self.settings.last_run_at
+        overdue = last_run_at is None or last_run_at < due
+        armed = self._scheduler is not None
+
+        notes = []
+        if not armed:
+            notes.append("The scheduler is not running, because whobot.toml sets no digest_channel.")
+        if overdue:
+            notes.append(f"The {_local(due, schedule.timezone)} run did not happen; a missed run is never replayed.")
+
+        return Report(
+            status=Status.OK if armed and not overdue else Status.WARN,
+            title=DIGEST_TITLE,
+            summary=f"Scheduled for {schedule}.",
+            sections=[
+                Section(
+                    fields=[
+                        Field(name="Next run", value=_local(schedule.next_after(now), schedule.timezone)),
+                        Field(
+                            name="Last run",
+                            value=_local(last_run_at, schedule.timezone) if last_run_at else "never",
+                        ),
+                        Field(name="Last result", value=self.settings.last_result or "nothing recorded"),
+                    ]
+                )
+            ],
+            notes=notes,
+        )
+
+    @action(label="Change digest schedule", description="Set the time of day the Daily Digest runs.")
+    async def set_digest_schedule(self, *, hour: int = 7, minute: int = 0) -> Report:
+        """Persist the schedule, which the running scheduler picks up on its next tick.
+
+        Validated here rather than left to the widget: the file must never come to hold a time
+        that ``WhobotSettings`` would refuse to load on the next start.
+        """
+        was = Schedule.from_settings(self.settings)
+        wrong = _not_a_time_of_day(hour, minute)
+        if wrong is not None:
+            return Report(
+                status=Status.FAIL,
+                title=DIGEST_TITLE,
+                summary=f"{wrong}. Still scheduled for {was}.",
+            )
+
+        try:
+            update_config(self.settings, {"schedule_hour": hour, "schedule_minute": minute})
+        except (ConfigWriteError, OSError) as e:
+            # A hand-edited file that no longer loads is worth saying out loud, rather than
+            # letting execute turn it into "the Action raised an unhandled error".
+            return Report(
+                status=Status.FAIL,
+                title=DIGEST_TITLE,
+                summary=f"The schedule could not be saved. Still scheduled for {was}.",
+                sections=[Section(error=str(e))],
+            )
+
+        now = Schedule.from_settings(self.settings)
+        return Report(
+            status=Status.OK,
+            title=DIGEST_TITLE,
+            summary=f"Scheduled for {now}, was {was}.",
+            sections=[
+                Section(fields=[Field(name="Next run", value=_local(now.next_after(datetime.now(UTC)), now.timezone))])
+            ],
+        )
+
+    @prefill(set_digest_schedule)
+    async def _schedule_prefill(self) -> dict[str, object]:
+        """Open the form on the schedule in force, not on the signature's defaults."""
+        return {"hour": self.settings.schedule_hour, "minute": self.settings.schedule_minute}
 
     @action(
         label="Check one Node",
@@ -623,7 +723,9 @@ class Whobot(ABC):
         pending: PendingInvocation,
         node: Node | None,
         handle: ReplyHandle,
-    ) -> None:
+        *,
+        announce: bool = True,
+    ) -> ActionResult:
         """Announce the run, run it, and post the outcome — whatever the outcome is.
 
         The invariant that makes the bot trustworthy is that **every announcement is
@@ -631,11 +733,14 @@ class Whobot(ABC):
         with no reply is worse than a clear failure: the operator cannot tell whether it
         happened, and has to go and check by hand. So every way out of the call posts
         something, including cancellation.
+
+        ``announce=False`` is for a run nobody clicked for: a scheduled digest posts one
+        message rather than a reply under an "is running" nobody was waiting to read.
         """
         # Worked out before anything is announced, because it depends on configuration that a
         # long-running process may have had reloaded under it.
         timeout_s = act.timeout_for(self.settings)
-        reply = await self.announce_start(act, pending, handle)
+        reply = await self.announce_start(act, pending, handle) if announce else handle
 
         try:
             result = await asyncio.wait_for(act.call(self, node, pending.params), timeout_s)
@@ -656,6 +761,8 @@ class Whobot(ABC):
             result = Report(status=Status.FAIL, title=act.label, summary="The Action raised an unhandled error.")
 
         await self.post_result(act, result, reply)
+        # Returned as well as posted, so a scheduled run can record what it did.
+        return result
 
     # ----------------------------------------------------------------------------------
     # What a Chat Platform must provide. The whole abstract surface.
@@ -683,11 +790,75 @@ class Whobot(ABC):
     @abstractmethod
     async def post_result(self, act: Action, result: ActionResult, reply: ReplyHandle) -> None: ...
 
+    @abstractmethod
+    def scheduled_handle(self) -> ReplyHandle:
+        """Where an unattended run posts, there being no interaction to reply to.
+
+        The one hook that is not ``async``: it builds a value rather than sending anything.
+        """
+
     # ----------------------------------------------------------------------------------
     # Running work, and stopping.
     # ----------------------------------------------------------------------------------
 
-    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+    def start_scheduler(self) -> None:
+        """Arm the Daily Digest, if there is anywhere for it to be posted."""
+        if not self.settings.digest_channel:
+            logger.warning("no digest_channel is set, so no Daily Digest will be posted on a schedule")
+            return
+        self._scheduler = asyncio.create_task(self.run_scheduler())
+
+    async def run_scheduler(self) -> None:
+        """Fire the Daily Digest at its scheduled time, for as long as the process runs.
+
+        **A missed run is never replayed.** The first target is computed strictly after
+        startup, so a schedule that came and went while Whobot was down is simply gone; the
+        Digest status Action is what reports the gap. A run that is merely *late* — the host
+        was suspended over its slot — still fires, because the digest measures the fleet as it
+        is now, which makes it late rather than wrong.
+        """
+        schedule = Schedule.from_settings(self.settings)
+        target = schedule.next_after(datetime.now(UTC))
+        logger.info("Daily Digest at %s; next run %s", schedule, target)
+
+        while True:
+            remaining = (target - datetime.now(UTC)).total_seconds()
+            await asyncio.sleep(min(max(remaining, 0.0), SCHEDULER_TICK_S))
+
+            current = Schedule.from_settings(self.settings)
+            if current != schedule:
+                schedule, target = current, current.next_after(datetime.now(UTC))
+                logger.info("Daily Digest moved to %s; next run %s", schedule, target)
+                continue
+
+            if datetime.now(UTC) >= target:
+                try:
+                    await self._run_scheduled_digest()
+                except Exception:
+                    # A digest that could not even be posted must not take tomorrow's with it.
+                    logger.exception("the scheduled Daily Digest failed")
+                target = schedule.next_after(datetime.now(UTC))
+                logger.info("next Daily Digest %s", target)
+
+    async def _run_scheduled_digest(self) -> None:
+        """Run the digest with nobody watching, and record what it did.
+
+        Recorded only after it has been posted, so a digest nobody could be told about still
+        counts as missed — which is the honest answer to "did the morning report arrive?".
+        """
+        act = self.actions[Whobot.run_digest.__name__]
+        result = await self.execute(
+            act, PendingInvocation(action=act.name), None, self.scheduled_handle(), announce=False
+        )
+        # Read off the result with getattr: the marker base declares no fields, and a digest
+        # that timed out comes back as a Report rather than a DigestResult.
+        status, summary = getattr(result, "status", Status.WARN), getattr(result, "summary", None)
+        update_config(
+            self.settings,
+            {"last_run_at": datetime.now(UTC), "last_result": f"{status} — {summary}" if summary else status},
+        )
+
+    def _spawn(self, coro: Coroutine[Any, Any, object]) -> None:
         """Run an Action without waiting for it, keeping a reference so it survives.
 
         Python garbage-collects a task nobody holds a reference to, so the set is
@@ -716,6 +887,13 @@ class Whobot(ABC):
         """
         self._accepting = False
 
+        if self._scheduler is not None:
+            # Cancelled outright rather than given the grace period: it is asleep almost
+            # always, and when it is not, a digest takes minutes and would use it all.
+            self._scheduler.cancel()
+            await asyncio.wait({self._scheduler}, timeout=grace_s)
+            self._scheduler = None
+
         if self._tasks:
             _, running = await asyncio.wait(set(self._tasks), timeout=grace_s)
             for task in running:
@@ -735,7 +913,11 @@ class Whobot(ABC):
         return NodeClient(node.api_url)
 
     def _menu(self) -> list[Action]:
-        """Every Action, in the order they are declared. The menu is the class body."""
+        """Every Action there is. The menu is the class body, so no menu code is ever edited.
+
+        Ordered by method name, since that is how ``inspect.getmembers`` sorts what the scan
+        walks — not by declaration order.
+        """
         return list(self.actions.values())
 
     # ----------------------------------------------------------------------------------
@@ -870,6 +1052,20 @@ class Whobot(ABC):
 # Pure helpers for a Node's check-up. Free functions rather than methods, because nothing
 # here needs a Node client — which keeps their tests the cheapest in the package.
 # --------------------------------------------------------------------------------------
+
+
+def _local(instant: datetime, timezone: ZoneInfo) -> str:
+    """Render an instant in the digest's zone, the only one an operator thinks in."""
+    return instant.astimezone(timezone).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _not_a_time_of_day(hour: int, minute: int) -> str | None:
+    """Name the first value that is out of range, or ``None`` if both are in it."""
+    for name, value in (("hour", hour), ("minute", minute)):
+        low, high = SCHEDULE_BOUNDS[name]
+        if not low <= value <= high:
+            return f"{name} must be between {low} and {high}, not {value}"
+    return None
 
 
 def _angles(values: list[float]) -> str:

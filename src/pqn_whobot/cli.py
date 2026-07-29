@@ -125,6 +125,11 @@ def serve() -> None:
         # raising, so without this a bad token looks like a bot that started and then
         # quietly never answered.
         await bot.check_credentials()
+        # Then where the digest goes, which otherwise fails at the next scheduled run.
+        problem = await bot.check_digest_channel()
+        if problem is not None:
+            typer.echo(problem, err=True)
+            raise typer.Exit(code=1)
         typer.echo(f"Connected. {len(settings.nodes)} Node(s) registered. Ctrl-C to stop.")
         await bot.serve()
 

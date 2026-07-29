@@ -4,8 +4,12 @@
 so callers that need a real config check that the file exists first.
 """
 
+import os
+import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfoNotFoundError
 
@@ -17,6 +21,12 @@ from pydantic_settings import BaseSettings
 from pydantic_settings import PydanticBaseSettingsSource
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import TomlConfigSettingsSource
+
+from pqn_node.core.config import write_config
+
+
+class ConfigWriteError(ValueError):
+    """A write to ``whobot.toml`` was rolled back because the result would not load."""
 
 
 class NodeEntry(BaseModel):
@@ -130,3 +140,63 @@ def config_path() -> Path:
     """Return the file settings are loaded from, relative to the working directory."""
     # pydantic-settings types this as "one path, or a list of them, or None"; ours is one path.
     return Path(WhobotSettings.model_config["toml_file"])  # type: ignore[arg-type]
+
+
+def _restore(path: Path, content: bytes | None) -> None:
+    """Put a file back exactly as it was, atomically, after a write that must not stand."""
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def update_config(settings: WhobotSettings, updates: Mapping[str, Any]) -> None:
+    """Write settings back to ``whobot.toml`` and apply them to the live object.
+
+    The counterpart of ``pqn_node``'s ``update_config``, which does the same for a Node, and
+    built on the same ``write_config`` — so comments survive and the file holding the Slack
+    tokens is replaced by an atomic rename rather than truncated.
+
+    File first, so a failed write leaves memory matching disk. Values are applied unvalidated,
+    as a Node's are. Key names *are* checked, since an unknown one is written happily and then
+    refused by ``extra="forbid"``.
+
+    And the result is **read back**, because the file being written is the one holding the Slack
+    tokens: if it does not load, Whobot cannot start again, and discovering that at 07:00 is the
+    worst moment. The failure this has actually caught is a *hand edit* made while Whobot was
+    running — a mutable key moved below the ``[[nodes]]`` tables, where TOML reads it as a field
+    of that Node and ``extra="forbid"`` refuses it. Whobot cannot repair the file, but it can
+    leave it exactly as it found it and say what is wrong, at the write rather than at the next
+    start.
+    """
+    unknown = [key for key in updates if key not in WhobotSettings.model_fields]
+    if unknown:
+        msg = f"not a WhobotSettings field: {', '.join(sorted(unknown))}"
+        raise KeyError(msg)
+
+    path = config_path()
+    before = path.read_bytes() if path.is_file() else None
+    write_config(path, updates)
+
+    try:
+        WhobotSettings()
+    except (OSError, ValueError) as e:
+        _restore(path, before)
+        msg = (
+            f"{path} does not load after that write, so it has been put back as it was:\n{e}\n"
+            "If a mutable key sits below a [[nodes]] table, move it above them: it belongs to that Node there."
+        )
+        raise ConfigWriteError(msg) from e
+
+    for key, value in updates.items():
+        setattr(settings, key, value)

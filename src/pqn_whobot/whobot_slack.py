@@ -41,6 +41,7 @@ from pqn_whobot.actions import Status
 from pqn_whobot.actions import decode
 from pqn_whobot.actions import encode
 from pqn_whobot.config import WhobotSettings
+from pqn_whobot.config import config_path
 from pqn_whobot.registry import Node
 from pqn_whobot.whobot import Whobot
 
@@ -63,6 +64,9 @@ BLOCK_LIMIT = 50
 Its size grows with the fleet, and Slack answers an over-long message with a bare
 ``invalid_blocks`` — so without this the whole digest is lost rather than its tail. Four Nodes
 fit comfortably; ten do not."""
+
+NUMBER_TYPES: tuple[type, ...] = (float, int)
+"""Parameter types rendered as a number input. An ``int`` disallows decimals; a ``float`` allows them."""
 
 IMAGE_SUFFIXES = ((b"\x89PNG\r\n\x1a\n", "png"), (b"GIF8", "gif"), (b"\xff\xd8\xff", "jpg"))
 """Magic numbers, so an upload can be named after what it actually is.
@@ -278,7 +282,7 @@ class WhobotSlack(Whobot):
                 params[option["value"]] = True
 
         for parameter in act.parameters:
-            if parameter.annotation is not float:
+            if parameter.annotation not in NUMBER_TYPES:
                 continue
             typed = (values.get(_param_block(parameter.name), {}).get(_param_block(parameter.name)) or {}).get("value")
             if typed:
@@ -390,13 +394,13 @@ class WhobotSlack(Whobot):
         """Generate the whole form from the Action's parameters.
 
         Every ``bool`` shares one checkbox group, because "which of these are on" is one
-        question; every ``float`` gets an input of its own. The scan has already refused any
-        parameter type without a mapping, so a parameter reaching here that is neither is a bug
-        in the scan rather than a bad Action.
+        question; every number gets an input of its own, since Slack keys a submitted value by
+        the block it was in. The scan has already refused any parameter type without a mapping,
+        so a parameter reaching here that is neither is a bug in the scan rather than a bad Action.
         """
         booleans = [p for p in act.parameters if p.annotation is bool]
         blocks = [cls._checkbox_block(booleans, initial)] if booleans else []
-        blocks += [cls._number_block(p, initial) for p in act.parameters if p.annotation is float]
+        blocks += [cls._number_block(p, initial) for p in act.parameters if p.annotation in NUMBER_TYPES]
         return blocks
 
     @staticmethod
@@ -422,7 +426,7 @@ class WhobotSlack(Whobot):
 
     @staticmethod
     def _number_block(parameter: Parameter, initial: dict[str, object]) -> Block:
-        """Render one ``float`` parameter as a number input, opened on its starting value.
+        """Render one numeric parameter as a number input, opened on its starting value.
 
         Optional, so an operator who clears it gets the Action's default rather than a form
         that refuses to submit.
@@ -435,7 +439,7 @@ class WhobotSlack(Whobot):
             "element": {
                 "type": "number_input",
                 "action_id": _param_block(parameter.name),
-                "is_decimal_allowed": True,
+                "is_decimal_allowed": parameter.annotation is float,
                 "initial_value": str(initial.get(parameter.name, parameter.default)),
             },
         }
@@ -490,6 +494,10 @@ class WhobotSlack(Whobot):
             blocks=[_section(f":hourglass_flowing_sand: Running *{_escape(act.label)}*{target}…")],
         )
         return SlackReply(channel=channel, thread_ts=posted["ts"])
+
+    def scheduled_handle(self) -> ReplyHandle:
+        """Post to the digest channel, with no thread: an unattended digest is its own message."""
+        return SlackReply(channel=self.settings.digest_channel)
 
     async def post_result(self, act: Action, result: ActionResult, reply: ReplyHandle) -> None:
         """Post an Action's outcome as a threaded reply under its announcement."""
@@ -651,6 +659,53 @@ class WhobotSlack(Whobot):
         # The URL this returns is deliberately discarded; the handler opens its own.
         await AsyncWebClient().apps_connections_open(app_token=self.settings.slack_app_token)
 
+    async def check_digest_channel(self) -> str | None:
+        """Return what is wrong with ``digest_channel``, or ``None`` if nothing is.
+
+        The tokens' preflight exists because a bad one looks like a bot that started and never
+        answered; a wrong channel is the same failure a day later — the digest simply doesn't
+        arrive, and only the log says why. Checked at startup instead.
+
+        Every answer but "the channel is there and Whobot is in it" stops the bot from starting,
+        including a token that lacks the scope to look: an unverifiable channel is the state this
+        exists to rule out. Only an empty ``digest_channel`` passes, since that turns the
+        scheduled digest off deliberately.
+
+        Reports rather than raises, so the CLI can say which setting is at fault instead of
+        offering the guidance for a rejected token.
+        """
+        from slack_sdk.errors import SlackApiError  # noqa: PLC0415
+
+        channel = self.settings.digest_channel
+        if not channel:
+            # A deliberate choice, not an error: start_scheduler already says the digest is off.
+            return None
+
+        try:
+            info = await self.app.client.conversations_info(channel=channel)
+        except SlackApiError as e:
+            error = e.response.get("error", "unknown")
+            if error == "missing_scope":
+                # Refusing to start rather than warning: a check that can be skipped is a check
+                # nobody has, and the alternative is the failure it exists to prevent. The
+                # granted scopes are quoted back because `channels:read` and `channels:history`
+                # sit next to each other in Slack's picker and only the first one works here.
+                return (
+                    f"Whobot cannot verify digest_channel {channel!r}: its bot token lacks channels:read "
+                    "(groups:read for a private channel).\n"
+                    f"  It currently has: {e.response.get('provided', 'nothing')}.\n"
+                    "  Add the scope under OAuth & Permissions, then Reinstall to Workspace."
+                )
+            return (
+                f"digest_channel {channel!r} in {config_path()} cannot be read: {error}. "
+                "The channel ID is at the bottom of the channel's About tab in Slack."
+            )
+
+        if not info["channel"].get("is_member"):
+            name = info["channel"].get("name", channel)
+            return f"Whobot is not in #{name}, so it cannot post the Daily Digest there. Invite it to the channel."
+        return None
+
     async def serve(self) -> None:
         """Hold the Socket Mode connection until the process is asked to stop.
 
@@ -662,6 +717,7 @@ class WhobotSlack(Whobot):
         from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler  # noqa: PLC0415
 
         handler = AsyncSocketModeHandler(self.app, self.settings.slack_app_token)
+        self.start_scheduler()
         try:
             # slack_bolt ships no annotations for these two, and mypy is strict here.
             await handler.start_async()  # type: ignore[no-untyped-call]
