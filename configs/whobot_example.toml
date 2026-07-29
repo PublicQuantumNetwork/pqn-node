@@ -1,0 +1,91 @@
+# Whobot configuration — the reference copy.
+#
+# MAKE SURE TO RENAME THIS FILE TO whobot.toml AND PLACE IT WHERE WHOBOT IS STARTED FROM
+#
+# Copy this to whobot.toml (gitignored) and fill it in. Whobot reads ./whobot.toml — the
+# filename is fixed and the directory is wherever Whobot is started from, exactly as a Node
+# reads its own ./config.toml. There is no path flag and no environment variable.
+#
+# This file holds the Slack tokens, so it is never committed. Whobot only reads it today;
+# once it starts recording the schedule and each digest run, it will write it atomically
+# (temp file + rename) so a crash can never leave it truncated.
+#
+# Whobot must NOT be pointed at a Node's config.toml.
+
+# Slack credentials. Socket Mode needs both; Node-facing commands (`whobot nodes`) work
+# without them. To create them, go to https://api.slack.com/apps, Create New App, From
+# scratch, and name it Whobot. Then:
+#
+#   Socket Mode           toggle on, generate an app-level token with `connections:write`.
+#                         That token is slack_app_token, and starts with "xapp-".
+#   OAuth & Permissions   bot token scopes `chat:write`, `commands`, `files:write` (for the
+#                         screenshot upload) and `channels:read` — NOT `channels:history`,
+#                         which sits next to it and does not work: Whobot never reads
+#                         messages, it checks that digest_channel exists and that it is in
+#                         it. Add `groups:read` too if the digest goes to a private channel.
+#                         Install to the workspace. That token is slack_bot_token, "xoxb-".
+#   Slash Commands        create /whobot. No Request URL is needed under Socket Mode.
+#   Interactivity         toggle on. Again no Request URL.
+#
+# Finally invite the bot to the channel the digest goes to, and put that channel's ID in
+# digest_channel below — `whobot serve` refuses to start until both are true, since otherwise
+# the first sign of trouble is a digest that silently never arrives.
+slack_bot_token = "xoxb-..."
+slack_app_token = "xapp-..."
+digest_channel = "C0123456789"  # channel ID the Daily Digest is posted to
+
+# Daily Digest schedule, interpreted in schedule_timezone — never the host's local time,
+# so moving the Whobot host doesn't move the digest. DST is handled by the zone.
+# Note UFL Nodes are Eastern, so 07:00 Central is 08:00 local for them.
+schedule_timezone = "America/Chicago"
+schedule_hour = 7
+schedule_minute = 0
+
+# How the digest measures a Node. The address is resolved on the Node, so 127.0.0.1 means each
+# Node's own host and one value serves the fleet; the port is the Node API's (9000 in
+# production, 8000 from a dev checkout). basis is the CHSH measurement angles.
+timetagger_address = "127.0.0.1:9000"
+basis = [0.0, 22.5]
+
+# How long one Game may take. Everything longer is derived from it: a Node's bound is its two
+# Games plus the two calls around them, and the digest's is that once per Node in the registry.
+# So adding a Node widens the digest's budget on its own, and no two settings can disagree
+# about the same wait.
+per_game_timeout_s = 600
+
+# How long a mere "are you there?" call waits. Far shorter than the digest budget, so
+# `whobot nodes` reports a dead address in seconds instead of appearing to hang.
+reachability_timeout_s = 5
+
+# Bound on one Node API call that does work — reading a config, writing availability, capturing
+# a screenshot. Neither key above fits: 5s is for "are you there?", 600s is for a whole Game.
+node_timeout_s = 30
+
+# How long a rebooted Node has to answer again before Whobot reports it as still down. Raise it
+# for a machine with a slow POST or one that fscks on boot; the Reboot Action's own budget is
+# worked out from this, so it always has time to report what it found.
+reboot_wait_s = 300
+
+# Development only. Screenshot is the one Action that needs a Node in front of a real
+# display — X11, KDE and `maim` — so on a laptop it can only ever fail. Point this at any
+# image file and the Screenshot Action answers with it and never calls the Node. The report
+# says as much, in a warning naming this setting, so nobody mistakes the picture for a Node.
+# Leave it out in production.
+# debug_screenshot_path = "/path/to/some-image.png"
+
+# Whobot writes these two back itself after each digest run; leave them out of a fresh file.
+# They must stay ABOVE the [[nodes]] tables below. A plain key written after a table belongs to
+# that table, so moving these to the end of the file makes them fields of the last Node, and
+# Whobot then refuses to start.
+# last_run_at = 2026-01-01T07:00:00-06:00
+# last_result = "ok"
+
+# The Node Registry. Whobot knows about exactly these Nodes — adding one is an edit here,
+# not a code change. Use each Node's address on the VPN; production Nodes listen on 9000.
+# Node *names* are deliberately not listed: Whobot reads them from each Node's
+# GET /node/config, so this file cannot drift out of date. An address is all an entry holds.
+[[nodes]]
+api_url = "http://xx.xx.xx.xx:9000"
+
+[[nodes]]
+api_url = "http://xx.xx.xx.xx:9000"

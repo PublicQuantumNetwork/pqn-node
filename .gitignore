@@ -168,3 +168,6 @@ cython_debug/
 .DS_Store
 
 config.toml
+
+# Whobot's config: holds the Slack tokens.
+whobot.toml

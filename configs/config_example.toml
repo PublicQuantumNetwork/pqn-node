@@ -53,13 +53,3 @@ dark_count = 0
 [rng_settings]
 channels = [1, 2]   # Timetagger channels to sample for singles parity
 fortune_size = 8    # Number of parity measurements per fortune run
-
-# Daily report settings (for automated Slack reporting of hardware + games)
-[daily_report]
-slack_webhook_url = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"  # Get from https://api.slack.com/apps
-api_url = "http://localhost:8000"  # API endpoint (usually localhost if running on same machine)
-timetagger_address = "127.0.0.1:8000"  # TimeTagger address
-follower_node_address = "192.168.1.100:9000"  # Replace with actual follower node address
-basis = [0, 22.5]  # CHSH basis angles to use for daily measurements
-overall_timeout_s = 1800  # Hard watchdog for the whole run (SIGALRM). Posts a Slack error and exits if exceeded.
-per_game_timeout_s = 600   # Per-game HTTP timeout.
