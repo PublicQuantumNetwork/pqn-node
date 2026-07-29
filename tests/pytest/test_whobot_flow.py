@@ -14,23 +14,31 @@ because dispatch consults the registry over HTTP on every ``scope=ONE`` click.
 """
 
 import asyncio
+import json
 import re
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
+from typing import ClassVar
 
 import httpx
 import pytest
 
+from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
+from pqn_whobot.actions import DEFAULT_TIMEOUT_S
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
+from pqn_whobot.actions import DigestResult
+from pqn_whobot.actions import NodeDigest
 from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import ReplyHandle
 from pqn_whobot.actions import Report
 from pqn_whobot.actions import Scope
+from pqn_whobot.actions import Section
 from pqn_whobot.actions import Status
 from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
@@ -38,7 +46,12 @@ from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeClient
 from pqn_whobot.registry import Node
+from pqn_whobot.whobot import GAME_TITLES
 from pqn_whobot.whobot import Whobot
+from pqn_whobot.whobot import _bell_verdict
+from pqn_whobot.whobot import _hardware_section
+from pqn_whobot.whobot import one_game_budget
+from pqn_whobot.whobot import one_node_budget
 
 ALICE = "http://node-a.invalid:9000"
 BOB = "http://node-b.invalid:9000"
@@ -167,8 +180,8 @@ class ClientSpy(FlowSpy):
 
     handler: Callable[[httpx.Request], httpx.Response]
 
-    def _client(self, node: Node, timeout_s: float | None = None) -> NodeClient:
-        return NodeClient(node.api_url, timeout_s or 5.0, transport=httpx.MockTransport(self.handler))
+    def _client(self, node: Node) -> NodeClient:
+        return NodeClient(node.api_url, transport=httpx.MockTransport(self.handler))
 
 
 # --------------------------------------------------------------------------------------
@@ -790,18 +803,36 @@ def test_an_answer_that_does_not_acknowledge_a_reboot_is_refused() -> None:
 SHORTCODE = re.compile(r":[a-z0-9_+-]+:")
 
 
-def _human_strings(report: Report) -> list[str]:
-    """Every string an operator reads, except ``Section.error``, which may hold a traceback."""
-    strings = [report.title, *([report.summary] if report.summary else []), *report.notes]
-    for section in report.sections:
+def _section_strings(sections: list[Section]) -> list[str]:
+    strings = []
+    for section in sections:
         strings += [text for text in (section.label, section.note) if text]
         strings += [f.name for f in section.fields]
         strings += [f.value for f in section.fields]
     return strings
 
 
-def assert_no_markup(report: Report) -> None:
-    for text in _human_strings(report):
+def _human_strings(result: ActionResult) -> list[str]:
+    """Every string an operator reads, except ``Section.error``, which may hold a traceback.
+
+    Takes an ``ActionResult`` and walks whichever shape it is, so the rule stays stated in one
+    place however many result shapes the package grows. It asserts on a shape it has no walker
+    for, which is what stops a third result type quietly escaping the rule.
+    """
+    if isinstance(result, Report):
+        strings = [result.title, *([result.summary] if result.summary else []), *result.notes]
+        return strings + _section_strings(result.sections)
+    if isinstance(result, DigestResult):
+        strings = [result.title, *([result.summary] if result.summary else []), *result.notes]
+        for node in result.nodes:
+            strings += [node.name, node.api_url, *_section_strings(node.sections)]
+        return strings
+    msg = f"no walker for {type(result).__name__}, so the no-markup rule would silently skip it"
+    raise AssertionError(msg)
+
+
+def assert_no_markup(result: ActionResult) -> None:
+    for text in _human_strings(result):
         assert "*" not in text, text
         assert "`" not in text, text
         assert not SHORTCODE.search(text), text
@@ -822,6 +853,21 @@ def test_no_action_output_contains_platform_markup(pending: PendingInvocation) -
     assert_no_markup(only_report(run(spy(ALICE, BOB), pending)))
 
 
+def test_a_check_ups_output_carries_no_platform_markup() -> None:
+    """The result with the most strings in it, and the only one with two levels of them."""
+    assert_no_markup(checked(with_node_api(node_api(), ALICE)))
+
+
+def test_the_rule_refuses_a_result_shape_it_cannot_walk() -> None:
+    """Otherwise a third result type would pass every neutrality test by not being read."""
+
+    class Bespoke(ActionResult):
+        pass
+
+    with pytest.raises(AssertionError, match="no walker"):
+        assert_no_markup(Bespoke())
+
+
 @pytest.mark.usefixtures("_reboot_without_the_waiting")
 def test_the_reboot_report_carries_no_platform_markup() -> None:
     """The Action most tempted by decoration — a Node's address in backticks — must resist it."""
@@ -838,3 +884,404 @@ def test_the_debug_screenshot_report_carries_no_platform_markup(tmp_path: Path) 
     bot = debug_bot(image, ALICE)
     asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
     assert_no_markup(only_report(bot))
+
+
+# --------------------------------------------------------------------------------------
+# Checking a Node over: the Games, the hardware checklist, and the whole check-up that the
+# Daily Digest fans out. Driven through the Actions, because that is how they are reached.
+# --------------------------------------------------------------------------------------
+
+HEALTHY = {
+    "router": {"reachable": True, "latency_ms": 3.2},
+    "devices": [{"reachable": True, "provider": "prov", "name": "tagger", "purpose": "counting", "latency_ms": 8.0}],
+    "rotary_encoder": None,
+    "follower_node": {"reachable": True, "latency_ms": 12.0},
+}
+
+CHSH = {
+    "chsh_value": 2.6134919,
+    "chsh_error": 0.04,
+    "expectation_values": [0.7, -0.65],
+    "expectation_errors": [0.01, 0.01],
+    "expectation_values_sign_fixed": [0.7, 0.65],
+}
+
+ALL_GAMES_ON = {"chsh": True, "qf": True, "ssm": True}
+
+
+def node_api(
+    *,
+    availability: object = ALL_GAMES_ON,
+    refuse: dict[str, int] | None = None,
+    seen: list[httpx.Request] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer every endpoint a check-up calls, with any of them able to refuse instead."""
+    refusals = refuse or {}
+    answers: dict[str, object] = {
+        "/health/": HEALTHY,
+        "/games/availability": availability,
+        "/chsh/": CHSH,
+        "/rng/fortune": [42, 137],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        path = request.url.path
+        if path in refusals:
+            return httpx.Response(refusals[path], json={"detail": f"{path} is not having it"})
+        if path not in answers:
+            return httpx.Response(404)
+        return httpx.Response(200, json=answers[path])
+
+    return handler
+
+
+def checked(bot: ClientSpy, action_name: str = "check_node", **params: object) -> DigestResult:
+    """Run one check-up Action and return the digest it posted."""
+    act = bot.actions[action_name]
+    node_url = ALICE if act.scope is Scope.ONE else None
+    pending = PendingInvocation(action=action_name, node_url=node_url, params=params or None)
+    asyncio.run(dispatched(bot, pending))
+    assert len(bot.drawn.results) == 1
+    result = bot.drawn.results[0]
+    assert isinstance(result, DigestResult)
+    return result
+
+
+def sections_of(digest: DigestResult) -> dict[str, Section]:
+    assert len(digest.nodes) == 1
+    return {section.label or "": section for section in digest.nodes[0].sections}
+
+
+# --- the pure helpers, which need no Node at all ---
+
+
+def test_every_probed_thing_gets_its_own_row() -> None:
+    """A Node with one dead device among nine live ones has to say which one is dead."""
+    unhealthy = HealthStatus.model_validate(
+        {
+            **HEALTHY,
+            "devices": [
+                {"reachable": True, "provider": "prov", "name": "tagger", "purpose": "counting"},
+                {"reachable": False, "provider": "prov", "name": "hwp", "purpose": "rotating", "error": "timed out"},
+            ],
+        }
+    )
+
+    hardware = _hardware_section(unhealthy)
+    rows = {f.name: f for f in hardware.fields}
+
+    assert hardware.status is Status.FAIL
+    assert rows["prov/tagger (counting)"].status is Status.OK
+    assert rows["prov/hwp (rotating)"].status is Status.FAIL
+    assert "timed out" in rows["prov/hwp (rotating)"].value
+
+
+def test_a_virtual_rotary_encoder_is_skipped_not_failed() -> None:
+    """Nothing was probed, so it is neither working nor broken, and a skip is not bad news."""
+    hardware = _hardware_section(HealthStatus.model_validate(HEALTHY))
+
+    assert next(f for f in hardware.fields if f.name == "Rotary encoder").status is Status.SKIPPED
+    assert hardware.status is Status.OK
+
+
+def test_a_violated_bell_inequality_is_the_good_news() -> None:
+    verdict = _bell_verdict(2.61)
+
+    assert verdict.status is Status.OK
+    assert "violated" in verdict.value
+
+
+def test_an_unviolated_bell_inequality_warns_rather_than_fails() -> None:
+    """The hardware answered and the Game ran; what stopped is the demonstration itself."""
+    verdict = _bell_verdict(1.94)
+
+    assert verdict.status is Status.WARN
+    assert "not violated" in verdict.value
+
+
+# --- one Node's whole check-up ---
+
+
+def test_a_healthy_node_reports_its_hardware_and_both_games() -> None:
+    digest = checked(with_node_api(node_api(), ALICE))
+
+    assert digest.status is Status.OK
+    assert list(sections_of(digest)) == ["Hardware", *GAME_TITLES.values()]
+    chsh = sections_of(digest)[GAME_TITLES["chsh"]]
+    assert next(f.value for f in chsh.fields if f.name == "S") == "2.6135 ± 0.0400"
+    assert chsh.note is not None, "a Game reports how long it took"
+
+
+def test_ssm_is_always_skipped_and_says_why() -> None:
+    """It needs an interactive coordination dance, so no unattended run can play it."""
+    ssm = sections_of(checked(with_node_api(node_api(), ALICE)))[GAME_TITLES["ssm"]]
+
+    assert ssm.status is Status.SKIPPED
+    assert "coordination dance" in ssm.fields[0].value
+
+
+def test_a_failed_hardware_probe_does_not_stop_the_games() -> None:
+    """The Games are what prove the physics still works, so they are still worth attempting."""
+    digest = checked(with_node_api(node_api(refuse={"/health/": 500}), ALICE))
+
+    assert digest.status is Status.FAIL
+    assert sections_of(digest)["Hardware"].error is not None
+    assert sections_of(digest)[GAME_TITLES["chsh"]].status is Status.OK
+
+
+def test_a_failed_game_carries_the_nodes_own_reason() -> None:
+    digest = checked(with_node_api(node_api(refuse={"/chsh/": 503}), ALICE))
+
+    chsh = sections_of(digest)[GAME_TITLES["chsh"]]
+    assert chsh.status is Status.FAIL
+    assert "is not having it" in str(chsh.error)
+    assert chsh.note is not None, "how long it ran before failing is worth knowing"
+    assert sections_of(digest)[GAME_TITLES["qf"]].status is Status.OK, "one Game failing does not stop the next"
+
+
+def test_a_game_the_node_does_not_offer_is_skipped_rather_than_attempted() -> None:
+    digest = checked(with_node_api(node_api(availability={"chsh": False, "qf": True, "ssm": True}), ALICE))
+
+    assert sections_of(digest)[GAME_TITLES["chsh"]].status is Status.SKIPPED
+    assert digest.status is Status.OK, "a Game switched off on purpose is not bad news"
+
+
+def test_availability_that_cannot_be_read_skips_every_game() -> None:
+    """Whether a Game may run is the Node's answer to give.
+
+    Assuming all-enabled is how an unattended run plays a Game an operator deliberately
+    switched off, so the error is reported on each Game instead.
+    """
+    digest = checked(with_node_api(node_api(refuse={"/games/availability": 500}), ALICE))
+
+    for title in GAME_TITLES.values():
+        skipped = sections_of(digest)[title]
+        assert skipped.status is Status.SKIPPED
+    assert "could not read" in sections_of(digest)[GAME_TITLES["chsh"]].fields[0].value
+
+
+def test_an_unreachable_node_is_one_section_and_no_calls() -> None:
+    """Probe nothing on a Node the registry already reported as unreachable.
+
+    Spending both Games' timeouts to rediscover it would make one unplugged Node the slowest
+    part of the whole digest.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(node_api(seen=seen), ALICE)
+    FLEET[:] = [Node(api_url=ALICE, reachable=False, error="ConnectError: refused")]
+
+    digest = checked(bot)
+
+    assert seen == []
+    assert digest.status is Status.FAIL
+    assert len(digest.nodes[0].sections) == 1
+    assert "refused" in str(digest.nodes[0].sections[0].error)
+
+
+def test_the_configured_measurement_values_are_what_an_unattended_run_uses() -> None:
+    """`timetagger_address` and `basis` come from Whobot's config, not from the Node."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(node_api(seen=seen), ALICE, timetagger_address="10.0.0.5:9000", basis=(11.0, 33.5))
+
+    checked(bot)
+
+    chsh = next(r for r in seen if r.url.path == "/chsh/")
+    fortune = next(r for r in seen if r.url.path == "/rng/fortune")
+    assert chsh.url.params["timetagger_address"] == "10.0.0.5:9000"
+    assert fortune.url.params["timetagger_address"] == "10.0.0.5:9000"
+    assert json.loads(chsh.content) == [11.0, 33.5]
+
+
+# --- the two Game Actions an operator drives by hand ---
+
+
+def test_running_chsh_by_hand_measures_at_the_angles_asked_for() -> None:
+    """The whole reason the Action takes parameters: an interactive run is aimed at something."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(node_api(seen=seen), ALICE, basis=(0.0, 22.5))
+
+    pending = PendingInvocation(action="run_chsh", node_url=ALICE, params={"angle_a": 15.0, "angle_b": 60.0})
+    asyncio.run(dispatched(bot, pending))
+
+    assert json.loads(next(r for r in seen if r.url.path == "/chsh/").content) == [15.0, 60.0]
+    assert only_report(bot).status is Status.OK
+
+
+def test_the_chsh_form_opens_on_the_angles_an_unattended_run_would_use() -> None:
+    """So the operator sees what the digest measures, and changes it deliberately."""
+    bot = with_node_api(node_api(), ALICE, basis=(11.0, 33.5))
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_chsh", node_url=ALICE)))
+
+    assert bot.drawn.initial == {"angle_a": 11.0, "angle_b": 33.5}
+
+
+def test_running_a_fortune_by_hand_reports_what_each_channel_drew() -> None:
+    bot = with_node_api(node_api(), ALICE)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_fortune", node_url=ALICE)))
+
+    result = only_report(bot)
+    assert result.status is Status.OK
+    assert result.sections[0].fields[0].value == "42, 137"
+
+
+# --------------------------------------------------------------------------------------
+# What an Action is allowed to take, which is worked out from the configuration it spends
+# rather than fixed when the class is created.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_declared_number_is_what_the_action_gets() -> None:
+    """Most Actions want a plain bound, and those keep working unchanged."""
+    act = FlowSpy.actions["screenshot"]
+
+    assert act.timeout_for(settings_for()) == pytest.approx(60.0)
+
+
+def test_a_budget_follows_the_configuration_it_spends() -> None:
+    """Raise the wait and the Reboot Action is allowed longer, with nothing else to edit.
+
+    This is what replaced the validator: the Action's bound *is* the sum of the calls it makes,
+    so a config edit cannot leave it too small to report what it found.
+    """
+    act = FlowSpy.actions["reboot"]
+    patient = settings_for(reboot_wait_s=1800.0)
+
+    assert act.timeout_for(settings_for()) == pytest.approx(30.0 + 300.0 + 5.0)
+    assert act.timeout_for(patient) == pytest.approx(30.0 + 1800.0 + 5.0)
+
+
+def test_a_game_action_is_allowed_the_game_plus_the_call_that_starts_it() -> None:
+    generous = settings_for(per_game_timeout_s=900.0)
+
+    assert FlowSpy.actions["run_chsh"].timeout_for(generous) == pytest.approx(930.0)
+    assert one_game_budget(generous) == pytest.approx(930.0)
+
+
+def test_checking_a_node_is_allowed_both_its_games() -> None:
+    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody."""
+    settings = settings_for()
+
+    assert one_node_budget(settings) == pytest.approx(2 * 30.0 + 2 * 600.0)
+    assert FlowSpy.actions["check_node"].timeout_for(settings) == pytest.approx(one_node_budget(settings))
+    assert one_node_budget(settings) >= 2 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
+
+
+def test_a_budget_that_cannot_be_worked_out_falls_back_rather_than_refusing_to_run() -> None:
+    """An announcement must always be followed by a result, including when the arithmetic is wrong."""
+
+    def broken(_settings: WhobotSettings) -> float:
+        raise ZeroDivisionError
+
+    act = replace(FlowSpy.actions["screenshot"], timeout_s=broken)
+
+    assert act.timeout_for(settings_for()) == pytest.approx(DEFAULT_TIMEOUT_S)
+
+
+# --------------------------------------------------------------------------------------
+# The whole-fleet digest.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_digest_reports_every_registered_node() -> None:
+    digest = checked(with_node_api(node_api(), ALICE, BOB), "run_digest")
+
+    assert [node.api_url for node in digest.nodes] == [ALICE, BOB]
+    assert digest.summary == "2 of 2 Nodes reported no problems"
+    assert digest.status is Status.OK
+
+
+def test_nodes_are_checked_one_at_a_time() -> None:
+    """A requirement, not simplicity: in two-Node CHSH one Node is another's follower.
+
+    Concurrent runs would contend for the same follower and the same timetagger, so the numbers
+    would be worthless. One Node's check-up must therefore *finish* before the next one starts.
+
+    Instrumented around ``_probe_node`` rather than around the HTTP calls, because the mock
+    transport answers without yielding to the event loop — so a digest rewritten as
+    ``asyncio.gather`` would still produce perfectly grouped requests and a test watching those
+    would pass. The ``sleep(0)`` is what makes the difference observable: under ``gather`` the
+    order becomes start, start, end, end.
+    """
+
+    class Recording(ClientSpy):
+        order: ClassVar[list[str]] = []
+
+        async def _probe_node(self, node: Node) -> NodeDigest:
+            self.order.append(f"start {node.name}")
+            await asyncio.sleep(0)
+            digest = await super()._probe_node(node)
+            self.order.append(f"end {node.name}")
+            return digest
+
+    bot = Recording(settings_for(ALICE, BOB))
+    bot.handler = node_api()
+
+    checked(bot, "run_digest")
+
+    assert Recording.order == [
+        "start uiuc-public-left",
+        "end uiuc-public-left",
+        "start ufl-public-right",
+        "end ufl-public-right",
+    ]
+
+
+def test_one_unreachable_node_does_not_stop_the_others() -> None:
+    """The whole reason a failure is a section rather than an exception."""
+    bot = with_node_api(node_api(), ALICE, BOB)
+    FLEET[:] = [Node(api_url=ALICE, reachable=False, error="ConnectError: refused"), REACHABLE[1]]
+
+    digest = checked(bot, "run_digest")
+
+    assert [node.status for node in digest.nodes] == [Status.FAIL, Status.OK]
+    assert digest.summary == "1 of 2 Nodes reported no problems"
+    assert digest.status is Status.FAIL
+
+
+def test_a_node_that_outlasts_its_budget_is_one_section_and_the_run_continues() -> None:
+    """One machine must not be able to spend the whole fleet's time."""
+
+    class SlowFirstNode(ClientSpy):
+        async def _probe_node(self, node: Node) -> NodeDigest:
+            if node.api_url == ALICE:
+                await asyncio.sleep(10)
+            return await super()._probe_node(node)
+
+    bot = SlowFirstNode(settings_for(ALICE, BOB, node_timeout_s=0.001, per_game_timeout_s=0.001))
+    bot.handler = node_api()
+
+    digest = checked(bot, "run_digest")
+
+    assert digest.nodes[0].status is Status.FAIL
+    assert "did not finish" in str(digest.nodes[0].sections[0].fields[0].value)
+    assert digest.nodes[1].status is Status.OK, "the next Node is still checked"
+
+
+def test_a_digest_with_no_nodes_says_so_rather_than_reporting_nothing() -> None:
+    bot = ClientSpy(settings_for())
+    bot.handler = node_api()
+
+    digest = checked(bot, "run_digest")
+
+    assert digest.status is Status.WARN
+    assert digest.nodes == []
+    assert "No Nodes are registered" in str(digest.summary)
+
+
+def test_the_digests_budget_grows_with_the_registry() -> None:
+    """What the callable timeout is for: adding a Node must not need a constant revisited."""
+    act = FlowSpy.actions["run_digest"]
+
+    two = act.timeout_for(settings_for(ALICE, BOB))
+    four = act.timeout_for(settings_for(ALICE, BOB, "http://c.invalid:9000", "http://d.invalid:9000"))
+
+    assert two == pytest.approx(2 * one_node_budget(settings_for()) + 30.0)
+    assert four - two == pytest.approx(2 * one_node_budget(settings_for()))
+
+
+def test_the_digests_output_carries_no_platform_markup() -> None:
+    assert_no_markup(checked(with_node_api(node_api(), ALICE, BOB), "run_digest"))

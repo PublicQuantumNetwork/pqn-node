@@ -37,24 +37,29 @@ schedule_timezone = "America/Chicago"
 schedule_hour = 7
 schedule_minute = 0
 
-# Per-Node bounds for the serial digest. Nodes are probed one at a time and each one runs
-# its Games for real, so total runtime scales with Node count — hence per-Node timeouts
-# rather than one global bound.
-per_node_timeout_s = 900
+# How the digest measures a Node. The address is resolved on the Node, so 127.0.0.1 means each
+# Node's own host and one value serves the fleet; the port is the Node API's (9000 in
+# production, 8000 from a dev checkout). basis is the CHSH measurement angles.
+timetagger_address = "127.0.0.1:9000"
+basis = [0.0, 22.5]
+
+# How long one Game may take. Everything longer is derived from it: a Node's bound is its two
+# Games plus the two calls around them, and the digest's is that once per Node in the registry.
+# So adding a Node widens the digest's budget on its own, and no two settings can disagree
+# about the same wait.
 per_game_timeout_s = 600
 
 # How long a mere "are you there?" call waits. Far shorter than the digest budget, so
 # `whobot nodes` reports a dead address in seconds instead of appearing to hang.
 reachability_timeout_s = 5
 
-# Bound on one Node API call made by an Action from Slack. Neither key above fits: 5s is
-# for "are you there?", and 900s is the digest's whole budget for a Node.
+# Bound on one Node API call that does work — reading a config, writing availability, capturing
+# a screenshot. Neither key above fits: 5s is for "are you there?", 600s is for a whole Game.
 node_timeout_s = 30
 
-# How long a rebooted Node has to answer again before Whobot reports it as still down. Raise
-# it for a machine with a slow POST or one that fscks on boot. It shares the Reboot Action's
-# 360s budget with node_timeout_s and reachability_timeout_s, and Whobot refuses to start if
-# the three together leave the Action no time to report what it found.
+# How long a rebooted Node has to answer again before Whobot reports it as still down. Raise it
+# for a machine with a slow POST or one that fscks on boot; the Reboot Action's own budget is
+# worked out from this, so it always has time to report what it found.
 reboot_wait_s = 300
 
 # Development only. Screenshot is the one Action that needs a Node in front of a real
@@ -67,7 +72,7 @@ reboot_wait_s = 300
 # The Node Registry. Whobot knows about exactly these Nodes — adding one is an edit here,
 # not a code change. Use each Node's address on the VPN; production Nodes listen on 9000.
 # Node *names* are deliberately not listed: Whobot reads them from each Node's
-# GET /node/config, so this file cannot drift out of date.
+# GET /node/config, so this file cannot drift out of date. An address is all an entry holds.
 [[nodes]]
 api_url = "http://xx.xx.xx.xx:9000"
 

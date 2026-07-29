@@ -36,11 +36,15 @@ class Node:
     latency_ms: float | None = None
 
 
-async def resolve_node(client: NodeClient) -> Node:
-    """Ask one Node for its name, timing the call. Unreachable is a result, not an exception."""
+async def resolve_node(client: NodeClient, timeout_s: float) -> Node:
+    """Ask one Node for its name, timing the call. Unreachable is a result, not an exception.
+
+    The bound is "are you there?" rather than the digest's per-Node budget: a listing must
+    report a dead address in seconds instead of appearing to hang.
+    """
     started = time.perf_counter()
     try:
-        config = await client.get_config()
+        config = await client.get_config(timeout_s)
     except NodeApiError as e:
         return Node(api_url=client.api_url, reachable=False, error=str(e))
     return Node(
@@ -58,5 +62,5 @@ async def resolve_nodes(settings: WhobotSettings) -> list[Node]:
     Concurrent because ``/node/config`` touches no hardware, so there is nothing for two
     Nodes to contend for — unlike the digest, which runs Games and so must be serial.
     """
-    clients = [NodeClient(entry.api_url, settings.reachability_timeout_s) for entry in settings.nodes]
-    return list(await asyncio.gather(*(resolve_node(client) for client in clients)))
+    clients = [NodeClient(entry.api_url) for entry in settings.nodes]
+    return list(await asyncio.gather(*(resolve_node(client, settings.reachability_timeout_s) for client in clients)))

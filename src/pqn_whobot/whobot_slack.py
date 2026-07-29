@@ -29,6 +29,9 @@ from slack_sdk.webhook.async_client import AsyncWebhookClient
 
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
+from pqn_whobot.actions import DigestResult
+from pqn_whobot.actions import NodeDigest
+from pqn_whobot.actions import Parameter
 from pqn_whobot.actions import PayloadError
 from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import ReplyHandle
@@ -53,6 +56,13 @@ HEADER_LIMIT = 150
 
 FIELDS_PER_SECTION = 10
 """Slack's cap on a section's ``fields`` grid. Actions emit one Section; this splits it."""
+
+BLOCK_LIMIT = 50
+"""Slack's cap on the blocks in one message, and the only result that can reach it is the digest.
+
+Its size grows with the fleet, and Slack answers an over-long message with a bare
+``invalid_blocks`` — so without this the whole digest is lost rather than its tail. Four Nodes
+fit comfortably; ten do not."""
 
 IMAGE_SUFFIXES = ((b"\x89PNG\r\n\x1a\n", "png"), (b"GIF8", "gif"), (b"\xff\xd8\xff", "jpg"))
 """Magic numbers, so an upload can be named after what it actually is.
@@ -82,6 +92,11 @@ CONFIRM_ACTION = "whobot_confirm"
 CANCEL_ACTION = "whobot_cancel"
 PARAMS_VIEW = "whobot_params"
 PARAMS_BLOCK = "whobot_params_block"
+
+
+def _param_block(name: str) -> str:
+    """Name the block a single-parameter widget lives in; Slack echoes it back as the answer's key."""
+    return f"whobot_param_{name}"
 
 
 @dataclass(frozen=True)
@@ -216,8 +231,8 @@ class WhobotSlack(Whobot):
                 # the form against, so let dispatch re-render with its note.
                 await self._safely(replace(pending, params=None), reply)
                 return
-            values = view.get("state", {}).get("values", {}).get(PARAMS_BLOCK, {})
-            await self._safely(replace(pending, params=self._read_checkboxes(act, values)), reply)
+            values = view.get("state", {}).get("values", {})
+            await self._safely(replace(pending, params=self._read_form(act, values)), reply)
 
     async def _from_interaction(self, body: dict[str, Any]) -> None:
         """Decode the widget the operator just used and continue the flow."""
@@ -243,21 +258,31 @@ class WhobotSlack(Whobot):
         )
 
     @staticmethod
-    def _read_checkboxes(act: Action, values: dict[str, Any]) -> dict[str, object]:
-        """Read a checkbox group back as one boolean per declared parameter.
+    def _read_form(act: Action, values: dict[str, Any]) -> dict[str, object]:
+        """Read a submitted form back as one value per declared parameter.
 
-        Slack reports only the *ticked* boxes, so an unticked one arrives as an absence
+        Slack reports only the *ticked* checkboxes, so an unticked one arrives as an absence
         rather than a ``False``. A submitted view echoes nothing else either — in particular
         **not** the ``initial_options`` it was rendered with — so the False floor has to come
         from what the Action declares. Without it a cleared box is missing from the payload,
         takes its default in ``coerce_params``, and switches the flag back *on*.
+
+        A number input needs no floor: an empty one is genuinely "no answer", and leaving it out
+        lets ``coerce_params`` supply the default.
         """
         params: dict[str, object] = {
             parameter.name: False for parameter in act.parameters if parameter.annotation is bool
         }
-        for element in values.values():
+        for element in values.get(PARAMS_BLOCK, {}).values():
             for option in element.get("selected_options", []) or []:
                 params[option["value"]] = True
+
+        for parameter in act.parameters:
+            if parameter.annotation is not float:
+                continue
+            typed = (values.get(_param_block(parameter.name), {}).get(_param_block(parameter.name)) or {}).get("value")
+            if typed:
+                params[parameter.name] = typed
         return params
 
     async def _safely(self, pending: PendingInvocation, reply: SlackReply) -> None:
@@ -356,21 +381,31 @@ class WhobotSlack(Whobot):
                 "submit": {"type": "plain_text", "text": "Run"},
                 "close": {"type": "plain_text", "text": "Cancel"},
                 "private_metadata": metadata,
-                "blocks": [self._checkbox_block(act, initial)],
+                "blocks": self._form_blocks(act, initial),
             },
         )
 
-    @staticmethod
-    def _checkbox_block(act: Action, initial: dict[str, object]) -> Block:
-        """Render every parameter as a checkbox. The only widget mapping that exists.
+    @classmethod
+    def _form_blocks(cls, act: Action, initial: dict[str, object]) -> list[Block]:
+        """Generate the whole form from the Action's parameters.
 
-        The scan has already refused any parameter type without a mapping, so reaching here
-        with something other than a ``bool`` is a bug in the scan rather than a bad Action.
+        Every ``bool`` shares one checkbox group, because "which of these are on" is one
+        question; every ``float`` gets an input of its own. The scan has already refused any
+        parameter type without a mapping, so a parameter reaching here that is neither is a bug
+        in the scan rather than a bad Action.
         """
-        options = [_option(parameter.name.upper(), parameter.name) for parameter in act.parameters]
+        booleans = [p for p in act.parameters if p.annotation is bool]
+        blocks = [cls._checkbox_block(booleans, initial)] if booleans else []
+        blocks += [cls._number_block(p, initial) for p in act.parameters if p.annotation is float]
+        return blocks
+
+    @staticmethod
+    def _checkbox_block(parameters: list[Parameter], initial: dict[str, object]) -> Block:
+        """Render the ``bool`` parameters as one checkbox group."""
+        options = [_option(parameter.name.upper(), parameter.name) for parameter in parameters]
         ticked = [
             _option(parameter.name.upper(), parameter.name)
-            for parameter in act.parameters
+            for parameter in parameters
             if initial.get(parameter.name, parameter.default)
         ]
         element: Block = {"type": "checkboxes", "action_id": PARAMS_BLOCK, "options": options}
@@ -383,6 +418,26 @@ class WhobotSlack(Whobot):
             "optional": True,
             "label": {"type": "plain_text", "text": "Enabled"},
             "element": element,
+        }
+
+    @staticmethod
+    def _number_block(parameter: Parameter, initial: dict[str, object]) -> Block:
+        """Render one ``float`` parameter as a number input, opened on its starting value.
+
+        Optional, so an operator who clears it gets the Action's default rather than a form
+        that refuses to submit.
+        """
+        return {
+            "type": "input",
+            "block_id": _param_block(parameter.name),
+            "optional": True,
+            "label": {"type": "plain_text", "text": parameter.name.replace("_", " ").title()},
+            "element": {
+                "type": "number_input",
+                "action_id": _param_block(parameter.name),
+                "is_decimal_allowed": True,
+                "initial_value": str(initial.get(parameter.name, parameter.default)),
+            },
         }
 
     async def ask_to_confirm(self, act: Action, pending: PendingInvocation, handle: ReplyHandle) -> None:
@@ -468,16 +523,7 @@ class WhobotSlack(Whobot):
 
     @_render.register
     def _render_report(self, result: Report) -> list[Block]:
-        blocks: list[Block] = [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"{self._emoji(result.status)} {result.title}"[:HEADER_LIMIT],
-                    "emoji": True,
-                },
-            }
-        ]
+        blocks: list[Block] = [self._header(result.status, result.title)]
         if result.summary:
             blocks.append(_section(_escape(result.summary)))
         for section in result.sections:
@@ -485,6 +531,50 @@ class WhobotSlack(Whobot):
         if result.notes:
             blocks.append(_context("\n".join(_escape(note) for note in result.notes)))
         return blocks
+
+    @_render.register
+    def _render_digest(self, result: DigestResult) -> list[Block]:
+        """Render the digest: a divider and a Node line, then that Node's ordinary Sections.
+
+        Everything about how a Section looks is inherited, so this adds only the grouping a flat
+        result cannot express. A second header block per Node was tried and reads badly — Slack
+        headers are all one size, so four Nodes look like four messages glued together.
+        """
+        blocks: list[Block] = [self._header(result.status, result.title)]
+        if result.summary:
+            blocks.append(_section(_escape(result.summary)))
+        footer = [_context("\n".join(_escape(note) for note in result.notes))] if result.notes else []
+
+        # One spare block for saying what was dropped, which must itself fit inside the limit.
+        budget = BLOCK_LIMIT - len(footer) - 1
+        for position, node in enumerate(result.nodes):
+            rendered = self._render_node(node)
+            if len(blocks) + len(rendered) > budget:
+                omitted = [n.name for n in result.nodes[position:]]
+                logger.warning("digest over Slack's %s-block limit; omitted %s", BLOCK_LIMIT, omitted)
+                blocks.append(
+                    _context(f"{len(omitted)} Nodes omitted, over Slack's message limit: {', '.join(omitted)}")
+                )
+                break
+            blocks += rendered
+
+        return blocks + footer
+
+    def _render_node(self, node: NodeDigest) -> list[Block]:
+        """One Node's part of the digest: a rule, a line naming it, and what was checked."""
+        return [
+            {"type": "divider"},
+            _section(f"{self._emoji(node.status)} *{_escape(node.name)}* — {_escape(node.api_url)}"),
+            *(block for section in node.sections for block in self._render_section(section)),
+        ]
+
+    @classmethod
+    def _header(cls, status: Status, title: str) -> Block:
+        """Slack truncates nothing itself: an over-long header is rejected, not shortened."""
+        return {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{cls._emoji(status)} {title}"[:HEADER_LIMIT], "emoji": True},
+        }
 
     @classmethod
     def _render_section(cls, section: Section) -> list[Block]:

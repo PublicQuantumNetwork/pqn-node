@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.config import config_path
 
@@ -23,7 +24,6 @@ schedule_timezone = "America/Chicago"
 schedule_hour = 7  # morning digest
 schedule_minute = 0
 
-per_node_timeout_s = 900
 per_game_timeout_s = 600
 
 # The Node Registry.
@@ -111,6 +111,42 @@ def test_defaults_are_host_agnostic() -> None:
     assert "localhost" not in settings.model_dump_json()
 
 
+def test_how_a_node_is_measured_is_one_answer_for_the_whole_network(tmp_path: Path) -> None:
+    """Not per-Node: a registry entry holds an address and nothing about measuring it.
+
+    ``timetagger_address`` is resolved on the Node — it builds
+    ``http://{timetagger_address}/timetagger/...`` — so one value serves every Node, and
+    ``basis`` is a measurement choice that belongs to the Network rather than to a machine.
+    """
+    (tmp_path / "whobot.toml").write_text(
+        'timetagger_address = "10.0.0.5:9000"\nbasis = [11.0, 33.5]\n'
+        '\n[[nodes]]\napi_url = "http://node-a.invalid:9000"\n',
+        encoding="utf-8",
+    )
+
+    settings = WhobotSettings()
+
+    assert settings.timetagger_address == "10.0.0.5:9000"
+    assert settings.basis == (11.0, 33.5)
+    assert set(NodeEntry.model_fields) == {"api_url"}
+
+
+def test_the_timetagger_default_is_the_nodes_own_host_not_whobots(tmp_path: Path) -> None:
+    """The one loopback default in Whobot, and it is not a host assumption.
+
+    Whobot never dials this address: it hands the string to a Node, which resolves it. So
+    127.0.0.1 means *that Node's* host, and a fleet of Nodes each measuring with their own
+    timetagger needs no per-Node configuration at all. Nothing here may assume which machine
+    Whobot runs on, and this does not.
+    """
+    (tmp_path / "whobot.toml").write_text("", encoding="utf-8")
+
+    settings = WhobotSettings()
+
+    assert settings.timetagger_address == "127.0.0.1:9000"
+    assert "localhost" not in settings.model_dump_json()
+
+
 def test_unknown_timezone_is_rejected(tmp_path: Path) -> None:
     (tmp_path / "whobot.toml").write_text('schedule_timezone = "Mars/Olympus_Mons"\n', encoding="utf-8")
 
@@ -123,9 +159,13 @@ def test_unknown_timezone_is_rejected(tmp_path: Path) -> None:
     [
         ("schedule_hour = 24\n", "schedule_hour"),
         ("schedule_minute = -1\n", "schedule_minute"),
-        ("per_node_timeout_s = 0\n", "per_node_timeout_s"),
+        ("per_game_timeout_s = 0\n", "per_game_timeout_s"),
         ('slack_bot_tokn = "typo"\n', "slack_bot_tokn"),
         ('[[nodes]]\napi_url = "node-a.invalid:9000"\n', "api_url"),
+        # `POST /chsh/` declares `basis: tuple[float, float]`, so a third angle is a typo that
+        # would otherwise be found by the Node refusing an unattended run at 07:00.
+        ("basis = [0.0, 22.5, 45.0]\n", "basis"),
+        ("basis = [0.0]\n", "basis"),
     ],
 )
 def test_invalid_values_name_the_offending_key(tmp_path: Path, body: str, expected: str) -> None:
@@ -136,27 +176,15 @@ def test_invalid_values_name_the_offending_key(tmp_path: Path, body: str, expect
         WhobotSettings()
 
 
-def test_a_reboot_wait_the_action_cannot_outlast_is_rejected(tmp_path: Path) -> None:
-    """A wait longer than the Action's own timeout loses the report it exists to produce.
+def test_a_removed_key_is_refused_rather_than_ignored(tmp_path: Path) -> None:
+    """`per_node_timeout_s` is derived now, so a file still setting it must say so, not be ignored.
 
-    ``execute`` would cut the run off at the Action's ``timeout_s`` and post "Timed out",
-    instead of the "still down after N minutes" that tells an operator to go and look at the
-    machine. Refusing it at load is the only place that can be said, since an Action's
-    ``timeout_s`` is fixed when the class is created.
+    ``extra="forbid"`` is what makes this loud: a key Whobot no longer reads would otherwise sit
+    in the file looking like it was doing something.
     """
-    (tmp_path / "whobot.toml").write_text("reboot_wait_s = 600\n", encoding="utf-8")
+    (tmp_path / "whobot.toml").write_text("per_node_timeout_s = 900\n", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match=r"reboot_wait_s.*no time to report"):
-        WhobotSettings()
-
-
-def test_the_reboot_wait_is_measured_against_the_calls_around_it(tmp_path: Path) -> None:
-    """The wait shares the Action's budget with the reboot call and the last poll of the wait."""
-    (tmp_path / "whobot.toml").write_text(
-        "reboot_wait_s = 331\nnode_timeout_s = 20\nreachability_timeout_s = 10\n", encoding="utf-8"
-    )
-
-    with pytest.raises(ValidationError, match="at most 330s"):
+    with pytest.raises(ValidationError, match="per_node_timeout_s"):
         WhobotSettings()
 
 

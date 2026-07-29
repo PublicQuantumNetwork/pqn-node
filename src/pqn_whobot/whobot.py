@@ -23,7 +23,8 @@ the ``timeout_s`` bounding the whole invocation. The signature says the rest.
 ``scope=Scope.ONE`` means the Action acts on one Node, which the operator picks and which
 arrives as the method's first argument; ``Scope.NONE`` means it acts on the Network and
 takes no Node. Every remaining parameter is keyword-only and becomes a question in the
-parameter form: one checkbox per ``bool``, which is the only widget mapping there is.
+parameter form: a checkbox per ``bool`` and a number input per ``float``, which are the only
+widget mappings there are.
 
 An Action returns an ``ActionResult``, usually a ``Report``, describing *what happened*. It
 must not emit platform markup: deciding what a result looks like belongs to the subclass,
@@ -86,10 +87,14 @@ from pathlib import Path
 from typing import Any
 from typing import ClassVar
 
+from pqn_node.api.routes.health import ComponentStatus
+from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
+from pqn_whobot.actions import DigestResult
 from pqn_whobot.actions import Field
+from pqn_whobot.actions import NodeDigest
 from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import ReplyHandle
 from pqn_whobot.actions import Report
@@ -99,7 +104,6 @@ from pqn_whobot.actions import Status
 from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
-from pqn_whobot.config import REBOOT_TIMEOUT_S
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
@@ -124,6 +128,54 @@ that is about to die and reports a machine that never went away."""
 
 REBOOT_POLL_INTERVAL_S = 5.0
 """How often a rebooting Node is asked whether it is back."""
+
+
+def one_game_budget(settings: WhobotSettings) -> float:
+    """How long an Action that plays one Game may take: the Game, plus the call that starts it."""
+    return settings.node_timeout_s + settings.per_game_timeout_s
+
+
+def whole_digest_budget(settings: WhobotSettings) -> float:
+    """How long a whole-fleet digest may take: one Node's budget for every registered Node.
+
+    This is why an Action's bound is a function of the settings rather than a constant. The
+    digest's duration grows with the registry, so a constant would be wrong for every fleet but
+    one — and when it fired, ``execute`` would post "Timed out" and throw away every section the
+    run had already gathered. Adding a Node now widens this on its own.
+
+    The extra Node call is for resolving the registry before any Node is checked.
+    """
+    return len(settings.nodes) * one_node_budget(settings) + settings.node_timeout_s
+
+
+def one_node_budget(settings: WhobotSettings) -> float:
+    """How long checking one Node over may take: two Node calls, then both Games it may play.
+
+    Derived rather than configured. A ``per_node_timeout_s`` key would be a second statement of
+    the same thing, free to disagree with it — and it did: the default was 900s while two Games
+    at 600s each need 1200s, so a Node whose Games were merely slow lost both measurements to a
+    budget nobody had chosen.
+    """
+    return 2 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
+
+
+DIGEST_TITLE = "Daily Digest"
+"""What the fleet-wide report is called, whether it was scheduled or asked for by hand."""
+
+BELL_CLASSICAL_LIMIT = 2.0
+"""An S above this is the Bell inequality being violated, which is the point of the exercise."""
+
+# FIXME: wrong home, and doing two jobs. What a Game is *called* is Node-domain knowledge —
+#  `GamesAvailability` carries these names in comments — and `set_availability` names the same
+#  three Games differently (`game.upper()`), so there are two namings in two places.
+#  `_play_games` also iterates this as the list-of-Games, so display order silently decides
+#  section order. Wants a home for Game domain facts, shared with `set_availability`.
+GAME_TITLES = {
+    "chsh": "CHSH — Verify Quantum Link",
+    "qf": "Quantum Fortune",
+    "ssm": "Share a Secret Message",
+}
+"""What each Game in ``GamesAvailability`` is called in front of an operator."""
 
 
 class Whobot(ABC):
@@ -192,7 +244,7 @@ class Whobot(ABC):
     async def node_info(self, node: Node) -> Report:
         """Report what a Node says about itself, read fresh rather than from the registry."""
         try:
-            config = await self._client(node).get_config()
+            config = await self._client(node).get_config(self.settings.node_timeout_s)
         except NodeApiError as e:
             return Report(
                 status=Status.FAIL,
@@ -233,7 +285,7 @@ class Whobot(ABC):
         """
         games = GamesAvailability(chsh=chsh, qf=qf, ssm=ssm)
         try:
-            applied = await self._client(node).set_availability(games)
+            applied = await self._client(node).set_availability(games, self.settings.node_timeout_s)
         except NodeApiError as e:
             return Report(
                 status=Status.FAIL,
@@ -279,8 +331,105 @@ class Whobot(ABC):
         ``model_dump`` keys this by Game name, which is what the form asks for, and is what
         keeps this method from naming the Games itself.
         """
-        availability = await self._client(node).get_availability()
+        availability = await self._client(node).get_availability(self.settings.node_timeout_s)
         return dict(availability.model_dump())
+
+    @action(
+        label="Run CHSH",
+        description="Measure one Node's quantum link now, at the angles you choose.",
+        scope=Scope.ONE,
+        timeout_s=one_game_budget,
+    )
+    async def run_chsh(self, node: Node, *, angle_a: float = 0.0, angle_b: float = 22.5) -> Report:
+        """Run one CHSH measurement and report what it measured.
+
+        The angles are asked for because they are a choice: an operator running this by hand is
+        usually running it *at* something. The digest, which nobody is watching, takes them from
+        configuration instead.
+        """
+        section = await self._play_chsh(node, (angle_a, angle_b))
+        return Report(status=section.status or Status.OK, title=f"CHSH — {node.name}", sections=[section])
+
+    @prefill(run_chsh)
+    async def _chsh_angles_prefill(self, _node: Node) -> dict[str, object]:
+        """Open the form on the angles an unattended run would use, so config is the starting point."""
+        angle_a, angle_b = self.settings.basis
+        return {"angle_a": angle_a, "angle_b": angle_b}
+
+    @action(
+        label="Run Quantum Fortune",
+        description="Draw one number per channel from a Node's quantum randomness.",
+        scope=Scope.ONE,
+        timeout_s=one_game_budget,
+    )
+    async def run_fortune(self, node: Node) -> Report:
+        """Run one Quantum Fortune and report what each channel drew.
+
+        No parameters: ``fortune_size`` and ``channels`` are the Node's own calibration, and
+        overriding them from Slack would make one run incomparable with the next.
+        """
+        section = await self._play_fortune(node)
+        return Report(status=section.status or Status.OK, title=f"Quantum Fortune — {node.name}", sections=[section])
+
+    @action(
+        label="Run digest now",
+        description="Check every Node in the registry, one after another.",
+        timeout_s=whole_digest_budget,
+    )
+    async def run_digest(self) -> DigestResult:
+        """Check every registered Node over, and report the fleet in one message.
+
+        Nodes are checked **one at a time**, and that is a requirement rather than simplicity:
+        in two-Node CHSH one Node acts as follower for another, so concurrent runs would contend
+        for the same follower and the same timetagger, and the numbers would be worthless.
+        """
+        nodes = await resolve_nodes(self.settings)
+        if not nodes:
+            return DigestResult(
+                status=Status.WARN,
+                title=DIGEST_TITLE,
+                summary="No Nodes are registered. Add a [[nodes]] entry to whobot.toml.",
+            )
+
+        budget = one_node_budget(self.settings)
+        digests = []
+        for node in nodes:
+            try:
+                digests.append(await asyncio.wait_for(self._probe_node(node), budget))
+            except TimeoutError:
+                # Bounded per Node so that one machine cannot spend the whole fleet's time. The
+                # sections that Node had already produced are lost with it; what survives is
+                # every *other* Node's, which is the point of the bound.
+                logger.warning("%s took longer than its %ss budget", node.api_url, budget)
+                digests.append(_timed_out(node, budget))
+
+        healthy = sum(1 for digest in digests if digest.status is Status.OK)
+        return DigestResult(
+            status=Status.overall(digest.status for digest in digests),
+            title=DIGEST_TITLE,
+            summary=f"{healthy} of {len(digests)} Nodes reported no problems",
+            nodes=digests,
+        )
+
+    @action(
+        label="Check one Node",
+        description="One Node's full check-up: its hardware, then the Games it offers.",
+        scope=Scope.ONE,
+        timeout_s=one_node_budget,
+    )
+    async def check_node(self, node: Node) -> DigestResult:
+        """Check one Node the way the Daily Digest checks every Node.
+
+        The same ``_probe_node`` the digest fans out over, so what an operator sees here is
+        exactly what the unattended run would have reported about this machine.
+        """
+        digest = await self._probe_node(node)
+        return DigestResult(
+            status=digest.status,
+            title=f"Check-up — {node.name}",
+            summary=f"{node.api_url} — hardware and Games",
+            nodes=[digest],
+        )
 
     @action(
         label="Screenshot",
@@ -298,7 +447,7 @@ class Whobot(ABC):
             return self._debug_screenshot(node, self.settings.debug_screenshot_path)
 
         try:
-            image = await self._client(node).get_screenshot()
+            image = await self._client(node).get_screenshot(self.settings.node_timeout_s)
         except NodeApiError as e:
             return Report(
                 status=Status.FAIL,
@@ -349,7 +498,8 @@ class Whobot(ABC):
         description="Reboot a Node's host, then wait for its API to answer again.",
         scope=Scope.ONE,
         destructive=True,
-        timeout_s=REBOOT_TIMEOUT_S,
+        # The call that asks for the reboot, the wait for the machine, and the last poll of it.
+        timeout_s=lambda s: s.node_timeout_s + s.reboot_wait_s + s.reachability_timeout_s,
     )
     async def reboot(self, node: Node) -> Report:
         """Reboot the Node's host and report whether it came back.
@@ -362,7 +512,7 @@ class Whobot(ABC):
         """
         title = f"Reboot — {node.name}"
         try:
-            ack = await self._client(node).reboot()
+            ack = await self._client(node).reboot(self.settings.node_timeout_s)
         except NodeApiError as e:
             return Report(
                 status=Status.FAIL,
@@ -419,11 +569,11 @@ class Whobot(ABC):
         """
         started = time.monotonic()
         await asyncio.sleep(REBOOT_SETTLE_S)
-        client = self._client(node, self.settings.reachability_timeout_s)
+        client = self._client(node)
 
         while time.monotonic() - started < self.settings.reboot_wait_s:
             try:
-                await client.get_config()
+                await client.get_config(self.settings.reachability_timeout_s)
             except NodeApiError:
                 await asyncio.sleep(REBOOT_POLL_INTERVAL_S)
                 continue
@@ -482,13 +632,16 @@ class Whobot(ABC):
         happened, and has to go and check by hand. So every way out of the call posts
         something, including cancellation.
         """
+        # Worked out before anything is announced, because it depends on configuration that a
+        # long-running process may have had reloaded under it.
+        timeout_s = act.timeout_for(self.settings)
         reply = await self.announce_start(act, pending, handle)
 
         try:
-            result = await asyncio.wait_for(act.call(self, node, pending.params), act.timeout_s)
+            result = await asyncio.wait_for(act.call(self, node, pending.params), timeout_s)
         except TimeoutError:
-            logger.warning("%s timed out after %ss", act.name, act.timeout_s)
-            result = Report(status=Status.FAIL, title=act.label, summary=f"Timed out after {act.timeout_s:.0f}s.")
+            logger.warning("%s timed out after %ss", act.name, timeout_s)
+            result = Report(status=Status.FAIL, title=act.label, summary=f"Timed out after {timeout_s:.0f}s.")
         except asyncio.CancelledError:
             # Posting from inside a cancelled coroutine cannot be awaited here — the await
             # would be cancelled too. Hand it to a task nothing cancels, which shutdown
@@ -577,17 +730,126 @@ class Whobot(ABC):
     # Helpers. None of these is an Action, so none can be invoked from a Chat Platform.
     # ----------------------------------------------------------------------------------
 
-    def _client(self, node: Node, timeout_s: float | None = None) -> NodeClient:
-        """Open a client for one Node, bounded by the timeout an Action's calls get.
-
-        ``timeout_s`` overrides that where a call is asking a different question: polling a
-        rebooting Node wants the "are you there?" bound, not the Action's.
-        """
-        return NodeClient(node.api_url, self.settings.node_timeout_s if timeout_s is None else timeout_s)
+    def _client(self, node: Node) -> NodeClient:
+        """Open a client for one Node. How long a call may take is stated at the call."""
+        return NodeClient(node.api_url)
 
     def _menu(self) -> list[Action]:
         """Every Action, in the order they are declared. The menu is the class body."""
         return list(self.actions.values())
+
+    # ----------------------------------------------------------------------------------
+    # Checking one Node over. Shared by "Check one Node", the two Game Actions, and the
+    # Daily Digest, which fans this out across the registry.
+    # ----------------------------------------------------------------------------------
+
+    async def _probe_node(self, node: Node) -> NodeDigest:
+        """Check one Node's hardware, then the Games it offers.
+
+        Every failure is a section rather than an exception, because a digest of four Nodes must
+        not be lost to one of them being unplugged. Whoever calls this bounds it per Node.
+        """
+        if not node.reachable:
+            # Already known from resolving the registry, so there is nothing to gain by spending
+            # both Games' timeouts finding it out again.
+            return NodeDigest(
+                name=node.name,
+                api_url=node.api_url,
+                status=Status.FAIL,
+                sections=[_failed_section("Node API", "Whobot cannot reach this Node.", node.error or "unreachable")],
+            )
+
+        try:
+            sections = [_hardware_section(await self._client(node).get_health(self.settings.node_timeout_s))]
+        except NodeApiError as e:
+            sections = [_failed_section("Hardware", "The hardware probe failed.", str(e))]
+
+        sections += await self._play_games(node)
+
+        return NodeDigest(
+            name=node.name,
+            api_url=node.api_url,
+            status=Status.overall(section.status for section in sections),
+            sections=sections,
+        )
+
+    async def _play_games(self, node: Node) -> list[Section]:
+        """Ask the Node which Games it offers, and play the ones it does.
+
+        Availability that cannot be read skips every Game rather than assuming all of them are
+        on. Whether a Game may run is the *Node's* answer to give: assuming is how an unattended
+        run plays a Game an operator deliberately switched off.
+        """
+        try:
+            availability = await self._client(node).get_availability(self.settings.node_timeout_s)
+        except NodeApiError as e:
+            reason = f"Whobot could not read this Node's Game availability: {e}"
+            return [_skipped_section(title, reason) for title in GAME_TITLES.values()]
+
+        sections = []
+        if availability.chsh:
+            sections.append(await self._play_chsh(node, self.settings.basis))
+        else:
+            sections.append(_skipped_section(GAME_TITLES["chsh"], "Not available on this Node."))
+
+        if availability.qf:
+            sections.append(await self._play_fortune(node))
+        else:
+            sections.append(_skipped_section(GAME_TITLES["qf"], "Not available on this Node."))
+
+        # SSM is never played, whether it is available or not — hence no branch on availability.
+        sections.append(
+            _skipped_section(
+                GAME_TITLES["ssm"], "Needs an interactive coordination dance, so an unattended run cannot play it."
+            )
+        )
+        return sections
+
+    async def _play_chsh(self, node: Node, basis: tuple[float, float]) -> Section:
+        """Run one CHSH at these angles, and describe what it measured or why it could not."""
+        label = GAME_TITLES["chsh"]
+        started = time.monotonic()
+        try:
+            result = await self._client(node).run_chsh(
+                self.settings.timetagger_address, basis, self.settings.per_game_timeout_s
+            )
+        except NodeApiError as e:
+            return _failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)
+
+        verdict = _bell_verdict(result.chsh_value)
+        return Section(
+            label=label,
+            status=verdict.status,
+            fields=[
+                verdict,
+                # Written out rather than dumped from the model: the error belongs beside the
+                # value it qualifies, and "S" is what a physicist calls this.
+                Field(name="S", value=f"{result.chsh_value:.4f} ± {result.chsh_error:.4f}"),
+                Field(name="Basis", value=f"{basis[0]:.1f}°, {basis[1]:.1f}°"),
+                Field(name="Expectation values", value=_angles(result.expectation_values)),
+                Field(name="Sign-fixed expectations", value=_angles(result.expectation_values_sign_fixed)),
+                Field(name="Expectation errors", value=_angles(result.expectation_errors)),
+            ],
+            note=f"{time.monotonic() - started:.1f}s",
+        )
+
+    async def _play_fortune(self, node: Node) -> Section:
+        """Draw one Quantum Fortune, and describe what each channel got or why it could not."""
+        label = GAME_TITLES["qf"]
+        started = time.monotonic()
+        try:
+            drawn = await self._client(node).run_fortune(
+                self.settings.timetagger_address, self.settings.per_game_timeout_s
+            )
+        except NodeApiError as e:
+            return _failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)
+
+        return Section(
+            label=label,
+            status=Status.OK,
+            fields=[Field(name="Fortune per channel", value=", ".join(str(number) for number in drawn) or "nothing")],
+            note=f"{time.monotonic() - started:.1f}s",
+        )
 
     async def _initial_params(self, act: Action, node: Node | None) -> dict[str, object]:
         """Work out what a parameter form should open on.
@@ -602,3 +864,97 @@ class Whobot(ABC):
         except Exception:
             logger.exception("%s: prefill failed, opening the form on its defaults", act.name)
             return defaults
+
+
+# --------------------------------------------------------------------------------------
+# Pure helpers for a Node's check-up. Free functions rather than methods, because nothing
+# here needs a Node client — which keeps their tests the cheapest in the package.
+# --------------------------------------------------------------------------------------
+
+
+def _angles(values: list[float]) -> str:
+    """Render a row of measured numbers, four decimals each, one convention for all of them."""
+    return ", ".join(f"{value:.4f}" for value in values)
+
+
+def _bell_verdict(chsh_value: float) -> Field:
+    """State whether the Bell inequality was violated. The digest's one judgement.
+
+    A ``WARN`` rather than a ``FAIL`` when it was not: the hardware answered and the Game ran,
+    so nothing is broken in the sense the rest of the checklist means. What stopped is the
+    demonstration of anything quantum, which is a different thing to go and look into.
+    """
+    if chsh_value > BELL_CLASSICAL_LIMIT:
+        return Field(
+            name="Bell inequality",
+            value=f"violated, S = {chsh_value:.4f} is above the classical limit of {BELL_CLASSICAL_LIMIT}",
+            status=Status.OK,
+        )
+    return Field(
+        name="Bell inequality",
+        value=f"not violated, S = {chsh_value:.4f} is within the classical limit of {BELL_CLASSICAL_LIMIT}",
+        status=Status.WARN,
+    )
+
+
+def _component_field(label: str, component: ComponentStatus) -> Field:
+    """Describe one probed thing as one checklist row, carrying its own status.
+
+    Per-row and not per-section, because a Node with one dead device and nine live ones has to
+    say which one is dead.
+    """
+    if component.reachable:
+        value = "reachable" if component.latency_ms is None else f"reachable, {component.latency_ms:.0f}ms"
+        return Field(name=label, value=value, status=Status.OK)
+    return Field(name=label, value=component.error or "unreachable", status=Status.FAIL)
+
+
+def _hardware_section(health: HealthStatus) -> Section:
+    """Describe a Node's hardware, one row per probed thing."""
+    fields = [_component_field("Router", health.router)]
+    fields += [_component_field(f"{d.provider}/{d.name} ({d.purpose})", d) for d in health.devices]
+    if health.rotary_encoder is None:
+        # Not probed rather than broken: a Node with a virtual encoder has nothing to probe.
+        fields.append(Field(name="Rotary encoder", value="virtual, not probed", status=Status.SKIPPED))
+    else:
+        fields.append(_component_field("Rotary encoder", health.rotary_encoder))
+    if health.follower_node is not None:
+        fields.append(_component_field("Follower Node", health.follower_node))
+
+    return Section(label="Hardware", status=Status.overall(f.status for f in fields), fields=fields)
+
+
+def _failed_section(label: str, summary: str, error: str, elapsed_s: float | None = None) -> Section:
+    """Describe something that was attempted and did not work."""
+    return Section(
+        label=label,
+        status=Status.FAIL,
+        fields=[Field(name="Result", value=summary, status=Status.FAIL)],
+        note=None if elapsed_s is None else f"{elapsed_s:.1f}s",
+        error=error,
+    )
+
+
+def _timed_out(node: Node, budget_s: float) -> NodeDigest:
+    """Describe a Node that outlasted the time the digest could give it."""
+    return NodeDigest(
+        name=node.name,
+        api_url=node.api_url,
+        status=Status.FAIL,
+        sections=[
+            _failed_section(
+                "Check-up",
+                f"This Node did not finish within the {budget_s:.0f}s a digest allows it.",
+                "The run was cut off, so whatever it had already measured was lost with it.",
+            )
+        ],
+    )
+
+
+def _skipped_section(label: str, reason: str) -> Section:
+    """Describe something that never ran.
+
+    ``SKIPPED`` is not ``WARN``: one means it did not happen, the other that it did and looked
+    wrong.
+    """
+    return Section(label=label, status=Status.SKIPPED, fields=[Field(name="Skipped", value=reason)])

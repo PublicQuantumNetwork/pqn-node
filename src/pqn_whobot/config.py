@@ -13,20 +13,10 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
-from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import PydanticBaseSettingsSource
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import TomlConfigSettingsSource
-
-REBOOT_TIMEOUT_S = 360.0
-"""Outer bound on a whole Reboot invocation, as ``@action`` declares it.
-
-It lives here rather than beside the Action because it is the ceiling ``reboot_wait_s`` is
-checked against, and this module may not import ``whobot.py`` — the dependency runs the other
-way. An Action's ``timeout_s`` is read by the scan while the class is being created, before
-any settings exist, so it cannot itself come from configuration.
-"""
 
 
 class NodeEntry(BaseModel):
@@ -63,20 +53,26 @@ class WhobotSettings(BaseSettings):
     schedule_hour: int = Field(default=7, ge=0, le=23)
     schedule_minute: int = Field(default=0, ge=0, le=59)
 
-    # Bounds for the serial digest, per Node rather than one bound for the whole run.
-    per_node_timeout_s: float = Field(default=900.0, gt=0)
+    # How the digest measures a Node. The address is resolved *on the Node*, so 127.0.0.1
+    # means each Node's own host and one value serves the fleet; the port is the Node API's.
+    timetagger_address: str = "127.0.0.1:9000"
+    basis: tuple[float, float] = (0.0, 22.5)
+
+    # How long one Game may take. The digest's per-Node and whole-run bounds are derived from
+    # this rather than configured beside it, so no two keys can disagree about the same wait.
     per_game_timeout_s: float = Field(default=600.0, gt=0)
 
-    # Bound for a single "are you there?" call, well under the digest's per-Node budget.
+    # Bound for a single "are you there?" call, so listing Nodes cannot stall on a dead one.
     reachability_timeout_s: float = Field(default=5.0, gt=0)
 
-    # Bound for one Node API call made by an Action. Neither existing key fits: 5s is for
-    # "are you there?", and 900s is the digest's whole budget for a Node.
+    # Bound for one Node API call that does work — reading a config, writing availability,
+    # capturing a screenshot. Longer than "are you there?", far shorter than a Game.
     node_timeout_s: float = Field(default=30.0, gt=0)
 
     # How long a rebooted Node has to answer again before it is reported as still down.
     # Site-specific, which is why it is here: a machine with a slow POST, or one that fscks
-    # on boot, legitimately takes longer than one that does not.
+    # on boot, legitimately takes longer than one that does not. The Reboot Action's own bound
+    # is worked out from this, so raising it cannot cut the report it exists to produce short.
     reboot_wait_s: float = Field(default=300.0, gt=0)
 
     # Development only: answer the Screenshot Action with this file instead of calling a
@@ -123,29 +119,6 @@ class WhobotSettings(BaseSettings):
             msg = f"schedule_timezone {value!r} is not a known IANA timezone: {e}"
             raise ValueError(msg) from e
         return value
-
-    @model_validator(mode="after")
-    def _reboot_must_be_able_to_report_itself(self) -> "WhobotSettings":
-        """Keep the reboot wait inside what the Reboot Action is allowed to take.
-
-        A wait that outlasts the Action's ``timeout_s`` is worse than a shorter one:
-        ``execute`` cuts the run off and posts "Timed out after 360s", losing the "still down
-        after 5 minutes — go and look at the machine" report the wait exists to produce.
-
-        The three keys are added because they are what one invocation spends: the call that
-        asks for the reboot, the wait, and the last poll of that wait.
-        """
-        budget = self.node_timeout_s + self.reboot_wait_s + self.reachability_timeout_s
-        if budget > REBOOT_TIMEOUT_S:
-            msg = (
-                f"reboot_wait_s ({self.reboot_wait_s:.0f}s) leaves the Reboot Action no time to report: "
-                f"with node_timeout_s ({self.node_timeout_s:.0f}s) and reachability_timeout_s "
-                f"({self.reachability_timeout_s:.0f}s) it needs {budget:.0f}s of the {REBOOT_TIMEOUT_S:.0f}s "
-                f"the Action is allowed. Lower reboot_wait_s to at most "
-                f"{REBOOT_TIMEOUT_S - self.node_timeout_s - self.reachability_timeout_s:.0f}s."
-            )
-            raise ValueError(msg)
-        return self
 
     @property
     def timezone(self) -> ZoneInfo:

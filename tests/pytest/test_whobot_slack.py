@@ -13,7 +13,9 @@ from typing import Any
 import pytest
 
 from pqn_whobot.actions import ActionResult
+from pqn_whobot.actions import DigestResult
 from pqn_whobot.actions import Field
+from pqn_whobot.actions import NodeDigest
 from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import Report
 from pqn_whobot.actions import Section
@@ -22,6 +24,7 @@ from pqn_whobot.actions import scan_actions
 from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.registry import Node
+from pqn_whobot.whobot_slack import BLOCK_LIMIT
 from pqn_whobot.whobot_slack import FIELDS_PER_SECTION
 from pqn_whobot.whobot_slack import HEADER_LIMIT
 from pqn_whobot.whobot_slack import OPTION_VALUE_LIMIT
@@ -31,6 +34,7 @@ from pqn_whobot.whobot_slack import SlackReply
 from pqn_whobot.whobot_slack import WhobotSlack
 from pqn_whobot.whobot_slack import _image_suffix
 from pqn_whobot.whobot_slack import _option_value
+from pqn_whobot.whobot_slack import _param_block
 
 ALICE = "http://node-a.invalid:9000"
 
@@ -170,6 +174,94 @@ def test_slack_control_characters_in_a_value_are_escaped(bot: WhobotSlack) -> No
 
 
 # --------------------------------------------------------------------------------------
+# Digest rendering: the one result with a level of nesting Report has no room for.
+# --------------------------------------------------------------------------------------
+
+
+def a_node_digest(name: str, *, status: Status = Status.OK, sections: int = 2) -> NodeDigest:
+    return NodeDigest(
+        name=name,
+        api_url=f"http://{name}.invalid:9000",
+        status=status,
+        sections=[
+            Section(label=f"Check {i}", status=Status.OK, fields=[Field(name="Router", value="up", status=Status.OK)])
+            for i in range(sections)
+        ],
+    )
+
+
+def a_digest(*nodes: NodeDigest, notes: list[str] | None = None) -> DigestResult:
+    return DigestResult(
+        status=Status.overall(node.status for node in nodes),
+        title="Daily Digest",
+        summary=f"{len(nodes)} Nodes",
+        nodes=list(nodes),
+        notes=notes or [],
+    )
+
+
+def test_each_node_is_separated_by_a_divider_and_named(bot: WhobotSlack) -> None:
+    """The grouping is the whole reason this result type exists rather than a flat Report."""
+    nodes = [a_node_digest("alice"), a_node_digest("bob")]
+
+    blocks = bot._render(a_digest(*nodes))  # noqa: SLF001
+
+    assert [block["type"] for block in blocks].count("divider") == len(nodes)
+    assert "*alice*" in texts(blocks)
+    assert "http://bob.invalid:9000" in texts(blocks)
+
+
+def test_a_nodes_own_status_is_marked_on_its_line(bot: WhobotSlack) -> None:
+    """So a fleet of four can be read at a glance without opening every section."""
+    blocks = bot._render(a_digest(a_node_digest("alice"), a_node_digest("bob", status=Status.FAIL)))  # noqa: SLF001
+
+    named = [json.dumps(block) for block in blocks if "*alice*" in json.dumps(block) or "*bob*" in json.dumps(block)]
+    assert STATUS_EMOJI[Status.OK] in named[0]
+    assert STATUS_EMOJI[Status.FAIL] in named[1]
+
+
+def test_a_nodes_sections_render_by_the_same_rules_as_any_other_result(bot: WhobotSlack) -> None:
+    """Nothing about Sections is re-implemented here, so a status-carrying Field is a line."""
+    digest = a_digest(a_node_digest("alice", sections=1))
+
+    blocks = bot._render(digest)  # noqa: SLF001
+
+    lines = [block.get("text", {}).get("text", "") for block in blocks]
+    assert f"{STATUS_EMOJI[Status.OK]} Router — up" in lines
+
+
+def test_a_fleet_too_large_for_one_message_loses_its_tail_and_says_so(bot: WhobotSlack) -> None:
+    """Slack refuses an over-long message outright, so the whole digest would be lost.
+
+    Losing the tail and being told which Nodes went missing is recoverable; losing all of it,
+    to a bare ``invalid_blocks``, is not.
+    """
+    blocks = bot._render(a_digest(*(a_node_digest(f"node-{i}", sections=4) for i in range(20))))  # noqa: SLF001
+
+    assert len(blocks) <= BLOCK_LIMIT
+    assert "Nodes omitted" in texts(blocks)
+    assert "node-19" in texts(blocks), "the omitted Nodes are named, or nobody knows what is missing"
+
+
+def test_a_digest_that_fits_is_not_truncated(bot: WhobotSlack) -> None:
+    """Four Nodes is the fleet this is built for, and must not trip the guard."""
+    blocks = bot._render(a_digest(*(a_node_digest(f"node-{i}") for i in range(4)), notes=["a footnote"]))  # noqa: SLF001
+
+    assert "omitted" not in texts(blocks)
+    assert "a footnote" in texts(blocks)
+
+
+def test_the_footer_survives_truncation(bot: WhobotSlack) -> None:
+    """It is budgeted for, because the notes say things like why a Game was skipped."""
+    blocks = bot._render(  # noqa: SLF001
+        a_digest(*(a_node_digest(f"node-{i}", sections=4) for i in range(20)), notes=["a footnote"])
+    )
+
+    assert len(blocks) <= BLOCK_LIMIT
+    assert "a footnote" in texts(blocks)
+
+
+# --------------------------------------------------------------------------------------
 # Every result type must be renderable.
 # --------------------------------------------------------------------------------------
 
@@ -267,22 +359,66 @@ def availability_action() -> Any:
     return scan_actions(WhobotSlack)["set_availability"]
 
 
-def test_a_bool_parameter_becomes_a_checkbox(bot: WhobotSlack) -> None:
-    block = bot._checkbox_block(availability_action(), {})  # noqa: SLF001
+def chsh_action() -> Any:
+    return scan_actions(WhobotSlack)["run_chsh"]
+
+
+def checkboxes(act: Any, initial: dict[str, object]) -> Block:
+    return next(b for b in WhobotSlack._form_blocks(act, initial) if b["block_id"] == PARAMS_BLOCK)  # noqa: SLF001
+
+
+def test_a_bool_parameter_becomes_a_checkbox() -> None:
+    block = checkboxes(availability_action(), {})
     assert block["element"]["type"] == "checkboxes"
     assert [o["value"] for o in block["element"]["options"]] == ["chsh", "qf", "ssm"]
 
 
-def test_the_form_opens_ticked_on_the_values_it_was_given(bot: WhobotSlack) -> None:
+def test_the_form_opens_ticked_on_the_values_it_was_given() -> None:
     """The prefill's whole purpose: the form shows the Node's flags, not the defaults."""
-    block = bot._checkbox_block(availability_action(), {"chsh": False, "qf": True, "ssm": False})  # noqa: SLF001
+    block = checkboxes(availability_action(), {"chsh": False, "qf": True, "ssm": False})
     assert [o["value"] for o in block["element"]["initial_options"]] == ["qf"]
 
 
-def test_a_form_with_nothing_ticked_omits_initial_options(bot: WhobotSlack) -> None:
+def test_a_form_with_nothing_ticked_omits_initial_options() -> None:
     """Slack rejects an empty initial_options outright rather than treating it as none."""
-    block = bot._checkbox_block(availability_action(), {"chsh": False, "qf": False, "ssm": False})  # noqa: SLF001
+    block = checkboxes(availability_action(), {"chsh": False, "qf": False, "ssm": False})
     assert "initial_options" not in block["element"]
+
+
+def test_a_float_parameter_becomes_a_number_input() -> None:
+    """The second widget mapping, and the reason a CHSH run can be aimed from Slack."""
+    blocks = WhobotSlack._form_blocks(chsh_action(), {"angle_a": 11.0, "angle_b": 33.5})  # noqa: SLF001
+
+    assert [b["element"]["type"] for b in blocks] == ["number_input", "number_input"]
+    assert [b["element"]["initial_value"] for b in blocks] == ["11.0", "33.5"]
+    assert all(b["element"]["is_decimal_allowed"] for b in blocks), "angles are not whole degrees"
+    assert [b["label"]["text"] for b in blocks] == ["Angle A", "Angle B"]
+
+
+def test_an_action_with_no_booleans_renders_no_checkbox_group() -> None:
+    """Slack rejects a checkbox element with no options, so an empty group must not be sent."""
+    blocks = WhobotSlack._form_blocks(chsh_action(), {})  # noqa: SLF001
+
+    assert all(b["block_id"] != PARAMS_BLOCK for b in blocks)
+
+
+def test_a_number_input_reads_back_as_the_actions_float() -> None:
+    """Slack sends a number input's value as a string, and the Action declared a float."""
+    act = chsh_action()
+    state = {
+        _param_block("angle_a"): {_param_block("angle_a"): {"type": "number_input", "value": "11.5"}},
+        _param_block("angle_b"): {_param_block("angle_b"): {"type": "number_input", "value": "33"}},
+    }
+
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 11.5, "angle_b": 33.0}  # noqa: SLF001
+
+
+def test_a_number_input_left_empty_falls_back_to_the_actions_default() -> None:
+    """Unlike a checkbox, an empty number input is genuinely no answer rather than a zero."""
+    act = chsh_action()
+    state = {_param_block("angle_a"): {_param_block("angle_a"): {"type": "number_input", "value": ""}}}
+
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 0.0, "angle_b": 22.5}  # noqa: SLF001
 
 
 def submitted(*ticked: str) -> dict[str, Any]:
@@ -297,7 +433,7 @@ def submitted(*ticked: str) -> dict[str, Any]:
 
 def test_an_unticked_checkbox_comes_back_as_false_rather_than_missing(bot: WhobotSlack) -> None:
     """Slack reports only what is ticked, so absence has to be reconstructed as False."""
-    read = bot._read_checkboxes(availability_action(), submitted("qf")[PARAMS_BLOCK])  # noqa: SLF001
+    read = bot._read_form(availability_action(), submitted("qf"))  # noqa: SLF001
     assert read == {"chsh": False, "qf": True, "ssm": False}
 
 
@@ -307,14 +443,14 @@ def test_a_form_submitted_with_everything_unticked_reads_as_all_false(bot: Whobo
     Every default on ``set_availability`` is True, so a payload of ``{}`` plus
     ``coerce_params`` used to turn "switch everything off" into "switch everything on".
     """
-    read = bot._read_checkboxes(availability_action(), submitted()[PARAMS_BLOCK])  # noqa: SLF001
+    read = bot._read_form(availability_action(), submitted())  # noqa: SLF001
     assert read == {"chsh": False, "qf": False, "ssm": False}
 
 
 def test_a_cleared_box_survives_coerce_params_as_false(bot: WhobotSlack) -> None:
     """The floor is only worth anything if it reaches the Action's arguments."""
     act = availability_action()
-    arguments = act.coerce_params(bot._read_checkboxes(act, submitted("qf")[PARAMS_BLOCK]))  # noqa: SLF001
+    arguments = act.coerce_params(bot._read_form(act, submitted("qf")))  # noqa: SLF001
     assert arguments == {"chsh": False, "qf": True, "ssm": False}
 
 

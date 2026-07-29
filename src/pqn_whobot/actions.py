@@ -35,6 +35,7 @@ from enum import StrEnum
 from typing import Any
 from typing import TypeVar
 
+from pqn_whobot.config import WhobotSettings
 from pqn_whobot.registry import Node
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,37 @@ class Report(ActionResult):
     notes: list[str] = dataclass_field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class NodeDigest:
+    """One Node's check-up. Not an ``ActionResult``: it is part of one.
+
+    Holds ordinary ``Section``s, so every rule about how a result renders is inherited rather
+    than restated. What it adds is the Node the sections belong to.
+    """
+
+    name: str
+    api_url: str
+    status: Status
+    sections: list[Section] = dataclass_field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DigestResult(ActionResult):
+    """One or more Nodes' check-ups in one result.
+
+    The one result ``Report`` cannot express, because Node x (hardware checklist + Games) is a
+    level of nesting deeper than a flat list of Sections. The grouping has to be structural:
+    with a flat list, the only way to say which Node a Section belongs to is to write the name
+    into the Section's label, and then nothing can tell where one Node ends and the next begins.
+    """
+
+    status: Status
+    title: str
+    summary: str | None = None
+    nodes: list[NodeDigest] = dataclass_field(default_factory=list)
+    notes: list[str] = dataclass_field(default_factory=list)
+
+
 # --------------------------------------------------------------------------------------
 # Declaring an Action.
 # --------------------------------------------------------------------------------------
@@ -161,13 +193,27 @@ _ACTION_ATTR = "_whobot_action"
 _PREFILL_ATTR = "_whobot_prefill"
 
 DEFAULT_TIMEOUT_S = 120.0
+"""What an Action is allowed when it does not say. Enough for any single Node API call."""
 
-WIDGET_TYPES: tuple[type, ...] = (bool,)
-"""Parameter types the form generator can render. ``bool`` becomes a checkbox.
+TimeoutSpec = float | Callable[[WhobotSettings], float]
+"""How long an Action may take: a number, or the settings it should be worked out from.
+
+A budget belongs with the configuration it spends. ``reboot`` may take the reboot call plus the
+wait plus one poll, and the digest may take one per-Node budget for every Node in the registry —
+so both are stated as arithmetic over ``WhobotSettings`` rather than as a constant that a config
+edit can silently contradict. That is why there is no validator checking a timeout against the
+config: an Action's bound *is* the sum of what it spends, so it cannot disagree with it.
+
+Resolved by ``Action.timeout_for`` at call time, which is the only moment the number is needed —
+the scan stores the declaration and never looks inside it.
+"""
+
+WIDGET_TYPES: tuple[type, ...] = (bool, float)
+"""Parameter types the form generator can render: ``bool`` a checkbox, ``float`` a number input.
 
 The scan rejects any other type by name, so an unsupported parameter fails at import with a
-message rather than producing an empty form. Adding ``str``, ``int``/``float`` or
-``Literal``/enum is one entry here and one branch in the Chat Platform's form renderer.
+message rather than producing an empty form. Adding ``str`` or ``Literal``/enum is one entry
+here and one branch in the Chat Platform's form renderer.
 """
 
 
@@ -175,9 +221,9 @@ message rather than producing an empty form. Adding ``str``, ``int``/``float`` o
 class Parameter:
     """One question the form asks, parsed from an Action's signature.
 
-    ``default`` is always set: a checkbox is ticked or it is not, so a ``bool`` with no
-    signature default starts unticked. A widget for which "no value" differs from a default
-    will need a ``required`` flag here.
+    ``default`` is always set: a checkbox is ticked or it is not, and a number input left empty
+    is the same as not answering, so both fall back to what the signature says. A widget for
+    which "no value" must be distinguished from a default will need a ``required`` flag here.
     """
 
     name: str
@@ -193,7 +239,7 @@ class ActionMeta:
     description: str | None = None
     scope: Scope = Scope.NONE
     destructive: bool = False
-    timeout_s: float = DEFAULT_TIMEOUT_S
+    timeout_s: TimeoutSpec = DEFAULT_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -211,9 +257,24 @@ class Action:
     description: str | None
     scope: Scope
     destructive: bool
-    timeout_s: float
+    timeout_s: TimeoutSpec
     parameters: tuple[Parameter, ...]
     prefill_name: str | None = None
+
+    def timeout_for(self, settings: WhobotSettings) -> float:
+        """How long this Action may take, given the configuration it will spend.
+
+        A declaration that cannot be worked out falls back to the default rather than stopping
+        the Action: an unresolvable budget is a bug in one Action's arithmetic, and refusing to
+        run would break the promise that every announcement is followed by a result.
+        """
+        if not callable(self.timeout_s):
+            return self.timeout_s
+        try:
+            return float(self.timeout_s(settings))
+        except Exception:
+            logger.exception("%s: could not work out its timeout; allowing the default", self.name)
+            return DEFAULT_TIMEOUT_S
 
     async def call(self, owner: object, node: Node | None, params: dict[str, object] | None) -> ActionResult:
         """Run the Action against ``owner``, passing the Node only when its scope declares one.
@@ -264,9 +325,11 @@ def action(
     description: str | None = None,
     scope: Scope = Scope.NONE,
     destructive: bool = False,
-    timeout_s: float = DEFAULT_TIMEOUT_S,
+    timeout_s: TimeoutSpec = DEFAULT_TIMEOUT_S,
 ) -> Callable[[F], F]:
     """Mark a method as an Action, recording what its signature cannot say.
+
+    ``timeout_s`` may be a number or a function of the settings — see ``TimeoutSpec``.
 
     The method is returned unchanged: this staples metadata onto it rather than wrapping it,
     so an Action stays an ordinary method and ``@prefill`` can link to it by identity.
