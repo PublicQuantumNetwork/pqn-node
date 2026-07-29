@@ -23,16 +23,6 @@ from pqn_node.constants import QKDEncodingBasis
 logger = logging.getLogger(__name__)
 
 
-class DailyReportConfig(BaseModel):
-    slack_webhook_url: str
-    follower_node_address: str
-    api_url: str = "http://localhost:8000"
-    timetagger_address: str = "127.0.0.1:8000"
-    basis: list[float] = Field(default_factory=lambda: [0.0, 22.5])
-    overall_timeout_s: int = 1800
-    per_game_timeout_s: int = 600
-
-
 class RNGSettings(BaseModel):
     channels: list[int] = Field(default_factory=lambda: [1, 2])
     fortune_size: int = 8
@@ -71,7 +61,6 @@ class Settings(BaseSettings):
     qkd_settings: QKDSettings = QKDSettings()
     rng_settings: RNGSettings = RNGSettings()
     bell_state: BellState = BellState.Phi_plus
-    daily_report: DailyReportConfig | None = None
     timetagger: tuple[str, str] | None = None  # Name of the timetagger to use for the CHSH experiment.
     rotary_encoder_address: str = "/dev/ttyACM0"
     virtual_rotator: bool = False  # If True, use terminal input instead of hardware rotary encoder
@@ -82,7 +71,7 @@ class Settings(BaseSettings):
         toml_file="./config.toml",
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # Allow extra fields in config.toml (e.g., daily_report)
+        extra="ignore",
     )
 
     @classmethod

@@ -128,18 +128,61 @@ The endpoint returns before the machine goes down, so the caller gets a response
 > [!WARNING]
 > Neither route is authenticated, like every other Node API route — Nodes are expected to listen only on their VPN addresses, and membership of that network is the trust boundary. Any member of it can reboot any Node.
 
-### Daily report
-
-Run or schedule the Slack health-report digest:
-
-```bash
-uv run pqn-node daily-report run
-uv run pqn-node daily-report schedule
-```
-
 ### Install the Web GUI
 
 See [pqn-gui](https://github.com/PublicQuantumNetwork/pqn-gui) for install and start instructions.
+
+## Whobot
+
+Whobot is how you operate a Network from Slack. It is the second deployable in this repo
+(`pqn_whobot`), and **one** instance serves **every** Node, talking to each over the Node API.
+It does not run on a Node — put it anywhere that can reach them.
+
+Type `/whobot` in Slack and pick from a menu:
+
+- **Daily Digest** — every Node's hardware health *and* a real CHSH and Quantum Fortune run, in
+  one scheduled message. Also runnable on demand, and its schedule is changeable from the menu.
+- **List Nodes / Node Info / Check one Node** — what is out there, and is it well.
+- **Screenshot / Reboot** — see a Node's screen, or restart it (with a confirm step).
+- **Change Game availability** — turn Games on and off without touching `config.toml`.
+- **Run CHSH / Run Quantum Fortune** — a single measurement, by hand.
+
+### Set up Whobot
+
+**1. Create the Slack app** at <https://api.slack.com/apps> → *Create New App* → *From scratch*,
+and name it Whobot. Then, in its settings:
+
+| Page | Do this |
+|---|---|
+| **Socket Mode** | Toggle on, and generate an app-level token with `connections:write`. This is `slack_app_token` (`xapp-…`). |
+| **OAuth & Permissions** | Bot token scopes `chat:write`, `commands`, `files:write`, `channels:read` — plus `groups:read` if the digest goes to a private channel. Install to the workspace and copy the bot token (`xoxb-…`) as `slack_bot_token`. |
+| **Slash Commands** | Create `/whobot`. Leave the Request URL blank. |
+| **Interactivity & Shortcuts** | Toggle on. Request URL blank here too. |
+
+Socket Mode is why both URLs stay blank: Whobot dials **out** to Slack, so it needs no public
+address, no certificate, and no inbound firewall rule. Watch the scope list — `channels:read` sits
+next to `channels:history`, and the wrong one makes Whobot refuse to start.
+
+Finally, invite the bot to the channel the digest should go to, and copy that channel's ID from
+the bottom of its *About* tab.
+
+**2. Configure and run.** `configs/whobot_example.toml` is a commented reference for every key.
+
+```bash
+cp configs/whobot_example.toml whobot.toml   # fill in: both tokens, digest_channel, each Node's address
+uv sync --extra whobot                       # the Slack transport; a Node itself does not need it
+uv run whobot nodes                          # check: every Node listed, named, and reachable
+uv run whobot serve                          # holds the Slack connection and fires the digest
+```
+
+Whobot reads `whobot.toml` from the directory it is started in, and never a Node's `config.toml` —
+its config is the Network's, not a machine's. `whobot serve` checks the tokens and the digest
+channel before it starts, so a bad token or a channel the bot is not in fails immediately rather
+than at 07:00.
+
+> [!NOTE]
+> Whobot has no access control of its own: anyone who can see the bot can run any Action,
+> including Reboot. The channel is the audit log.
 
 ## Acknowledgements
 
