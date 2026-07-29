@@ -29,6 +29,7 @@ from pqn_whobot.whobot_slack import PARAMS_BLOCK
 from pqn_whobot.whobot_slack import STATUS_EMOJI
 from pqn_whobot.whobot_slack import SlackReply
 from pqn_whobot.whobot_slack import WhobotSlack
+from pqn_whobot.whobot_slack import _image_suffix
 from pqn_whobot.whobot_slack import _option_value
 
 ALICE = "http://node-a.invalid:9000"
@@ -209,6 +210,29 @@ def test_a_result_type_with_no_renderer_fails_loudly(bot: WhobotSlack) -> None:
 
     with pytest.raises(NotImplementedError, match="no renderer registered"):
         bot._render(Unrenderable())  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------------------
+# Uploading an image.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("image", "suffix"),
+    [
+        (b"\x89PNG\r\n\x1a\nrest of a screenshot", "png"),
+        (b"GIF89a and the rest", "gif"),
+        (b"\xff\xd8\xff\xe0 and the rest", "jpg"),
+    ],
+)
+def test_an_upload_is_named_after_what_its_bytes_are(image: bytes, suffix: str) -> None:
+    """Slack picks how to display a file from its filename, so a GIF sent as .png arrives broken."""
+    assert _image_suffix(image) == suffix
+
+
+def test_an_unrecognised_image_is_uploaded_as_a_png() -> None:
+    """Every Action that produces one produces a PNG; the fallback must not be an error."""
+    assert _image_suffix(b"something else entirely") == "png"
 
 
 # --------------------------------------------------------------------------------------

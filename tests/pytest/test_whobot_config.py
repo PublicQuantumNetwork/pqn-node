@@ -136,6 +136,30 @@ def test_invalid_values_name_the_offending_key(tmp_path: Path, body: str, expect
         WhobotSettings()
 
 
+def test_a_reboot_wait_the_action_cannot_outlast_is_rejected(tmp_path: Path) -> None:
+    """A wait longer than the Action's own timeout loses the report it exists to produce.
+
+    ``execute`` would cut the run off at the Action's ``timeout_s`` and post "Timed out",
+    instead of the "still down after N minutes" that tells an operator to go and look at the
+    machine. Refusing it at load is the only place that can be said, since an Action's
+    ``timeout_s`` is fixed when the class is created.
+    """
+    (tmp_path / "whobot.toml").write_text("reboot_wait_s = 600\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match=r"reboot_wait_s.*no time to report"):
+        WhobotSettings()
+
+
+def test_the_reboot_wait_is_measured_against_the_calls_around_it(tmp_path: Path) -> None:
+    """The wait shares the Action's budget with the reboot call and the last poll of the wait."""
+    (tmp_path / "whobot.toml").write_text(
+        "reboot_wait_s = 331\nnode_timeout_s = 20\nreachability_timeout_s = 10\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValidationError, match="at most 330s"):
+        WhobotSettings()
+
+
 def test_malformed_toml_is_a_parse_error(tmp_path: Path) -> None:
     (tmp_path / "whobot.toml").write_text("schedule_hour = \n", encoding="utf-8")
 

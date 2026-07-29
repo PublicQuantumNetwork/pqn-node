@@ -167,8 +167,8 @@ class ClientSpy(FlowSpy):
 
     handler: Callable[[httpx.Request], httpx.Response]
 
-    def _client(self, node: Node) -> NodeClient:
-        return NodeClient(node.api_url, 5.0, transport=httpx.MockTransport(self.handler))
+    def _client(self, node: Node, timeout_s: float | None = None) -> NodeClient:
+        return NodeClient(node.api_url, timeout_s or 5.0, transport=httpx.MockTransport(self.handler))
 
 
 # --------------------------------------------------------------------------------------
@@ -200,8 +200,8 @@ def _registry_is_not_the_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     FLEET[:] = []
 
 
-def settings_for(*urls: str) -> WhobotSettings:
-    return WhobotSettings(nodes=[NodeEntry(api_url=url) for url in urls])
+def settings_for(*urls: str, **overrides: object) -> WhobotSettings:
+    return WhobotSettings(nodes=[NodeEntry(api_url=url) for url in urls], **overrides)
 
 
 def spy(*urls: str, nodes: list[Node] | None = None) -> FlowSpy:
@@ -485,8 +485,8 @@ def test_a_node_that_answers_without_a_name_is_a_warning_not_a_failure() -> None
 # --------------------------------------------------------------------------------------
 
 
-def with_node_api(handler: Callable[[httpx.Request], httpx.Response], *urls: str) -> ClientSpy:
-    bot = ClientSpy(settings_for(*urls))
+def with_node_api(handler: Callable[[httpx.Request], httpx.Response], *urls: str, **settings: object) -> ClientSpy:
+    bot = ClientSpy(settings_for(*urls, **settings))
     bot.handler = handler
     return bot
 
@@ -600,6 +600,189 @@ def test_the_form_asks_about_every_game() -> None:
 
 
 # --------------------------------------------------------------------------------------
+# screenshot: the image, and the debug file that stands in for a display.
+# --------------------------------------------------------------------------------------
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"not really a PNG, but it starts like one" * 20
+GIF = b"GIF89a" + b"nor is this a GIF" * 20
+
+
+def serving_an_image(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+    return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+
+def test_screenshot_carries_the_image_on_the_result() -> None:
+    """``Report.image`` gets its first real exercise here; nothing else produces one."""
+    bot = with_node_api(serving_an_image, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    result = only_report(bot)
+    assert result.status is Status.OK
+    assert result.image == PNG
+
+
+def test_a_node_that_cannot_capture_says_why() -> None:
+    """The Node's own reason must survive the trip, or the operator reads its logs to learn it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(503, json={"detail": "'maim' is not installed on this Node"})
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert result.image is None
+    assert result.sections[0].error is not None
+    assert "maim" in result.sections[0].error
+
+
+def test_something_that_is_not_an_image_is_not_uploaded_as_a_screenshot() -> None:
+    """A captive portal answering 200 with HTML must not become a picture of a Node."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(200, text="<html>sign in to continue</html>")
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert result.image is None
+
+
+def debug_bot(path: Path, *urls: str) -> ClientSpy:
+    """Build a Whobot answering Screenshot from a file, whose Node API refuses every call."""
+
+    def never(request: httpx.Request) -> httpx.Response:
+        msg = f"the Node was called: {request.url}"
+        raise AssertionError(msg)
+
+    bot = ClientSpy(settings_for(*urls, debug_screenshot_path=path))
+    bot.handler = never
+    return bot
+
+
+def test_the_debug_screenshot_answers_from_a_file_without_calling_the_node(tmp_path: Path) -> None:
+    """The point of the setting: the whole Action path runs on a laptop that has no display."""
+    image = tmp_path / "spongebob.gif"
+    image.write_bytes(GIF)
+
+    bot = debug_bot(image, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    assert only_report(bot).image == GIF
+
+
+def test_the_debug_screenshot_says_it_is_not_the_nodes_display(tmp_path: Path) -> None:
+    """A picture mistaken for a Node's display is worse than no picture at all."""
+    image = tmp_path / "spongebob.gif"
+    image.write_bytes(GIF)
+
+    bot = debug_bot(image, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    result = only_report(bot)
+    assert result.status is Status.WARN
+    assert result.summary is not None
+    assert "not the Node's display" in result.summary
+    assert any("debug_screenshot_path" in note for note in result.notes)
+
+
+def test_a_debug_screenshot_path_that_cannot_be_read_is_a_failure(tmp_path: Path) -> None:
+    """Silently falling back to the Node would answer a laptop's screenshot with a 503 instead."""
+    bot = debug_bot(tmp_path / "deleted.gif", ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert result.image is None
+    assert result.summary is not None
+    assert "debug_screenshot_path" in result.summary
+
+
+# --------------------------------------------------------------------------------------
+# reboot: the confirm step, and the poll that says whether the Node came back.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _reboot_without_the_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse the settle period and the poll interval, keeping the sequence intact."""
+    monkeypatch.setattr("pqn_whobot.whobot.REBOOT_SETTLE_S", 0.0)
+    monkeypatch.setattr("pqn_whobot.whobot.REBOOT_POLL_INTERVAL_S", 0.0)
+
+
+def rebooting(comes_back_after: int | None) -> Callable[[httpx.Request], httpx.Response]:
+    """Build a Node that acks a reboot, then refuses ``comes_back_after`` polls before answering.
+
+    ``None`` is the Node that never comes back — the failure the poll exists to catch.
+    """
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        if request.url.path == "/system/reboot":
+            return httpx.Response(200, json={"scheduled": True, "detail": "Rebooting in 1s"})
+        polls += 1
+        if comes_back_after is None or polls <= comes_back_after:
+            msg = "Connection refused"
+            raise httpx.ConnectError(msg, request=request)
+        return httpx.Response(200, json={"node_name": "uiuc-public-left"})
+
+    return handler
+
+
+def test_reboot_asks_to_confirm_first() -> None:
+    """The first shipped destructive Action: picking it from a dropdown must not reboot anything."""
+    bot = run(spy(ALICE), PendingInvocation(action="reboot", node_url=ALICE))
+    assert bot.drawn.calls == ["ask_to_confirm"]
+
+
+@pytest.mark.usefixtures("_reboot_without_the_waiting")
+def test_a_confirmed_reboot_polls_until_the_node_answers() -> None:
+    bot = with_node_api(rebooting(comes_back_after=2), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="reboot", node_url=ALICE, confirmed=True)))
+    result = only_report(bot)
+    assert result.status is Status.OK
+    assert result.summary is not None
+    assert "is back" in result.summary
+    assert [f.status for f in result.sections[0].fields] == [Status.OK, Status.OK]
+
+
+@pytest.mark.usefixtures("_reboot_without_the_waiting")
+def test_a_node_that_never_comes_back_is_reported_as_still_down() -> None:
+    """The real guardrail: the confirm step protects the wrong Node, this protects against a lost one."""
+    bot = with_node_api(rebooting(comes_back_after=None), ALICE, reboot_wait_s=0.05)
+    asyncio.run(dispatched(bot, PendingInvocation(action="reboot", node_url=ALICE, confirmed=True)))
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert result.sections[0].fields[-1].status is Status.FAIL
+    assert "still down" in result.sections[0].fields[-1].value
+
+
+def test_a_node_that_refuses_the_reboot_is_not_polled_for() -> None:
+    """Nothing was rebooted, so waiting five minutes to say so would be five wasted minutes."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        msg = "Connection refused"
+        raise httpx.ConnectError(msg, request=request)
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="reboot", node_url=ALICE, confirmed=True)))
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert result.summary is not None
+    assert "nothing was rebooted" in result.summary
+
+
+def test_an_answer_that_does_not_acknowledge_a_reboot_is_refused() -> None:
+    """Something else on that port must not be read as a Node that is now rebooting."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(200, json={"hello": "world"})
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="reboot", node_url=ALICE, confirmed=True)))
+    assert only_report(bot).status is Status.FAIL
+
+
+# --------------------------------------------------------------------------------------
 # Neutrality: nothing an Action produces may carry platform markup.
 # --------------------------------------------------------------------------------------
 
@@ -617,6 +800,13 @@ def _human_strings(report: Report) -> list[str]:
     return strings
 
 
+def assert_no_markup(report: Report) -> None:
+    for text in _human_strings(report):
+        assert "*" not in text, text
+        assert "`" not in text, text
+        assert not SHORTCODE.search(text), text
+
+
 @pytest.mark.parametrize(
     "pending",
     [
@@ -629,8 +819,22 @@ def _human_strings(report: Report) -> list[str]:
 )
 def test_no_action_output_contains_platform_markup(pending: PendingInvocation) -> None:
     """An Action describes what happened; decoration is the Chat Platform's business."""
-    bot = run(spy(ALICE, BOB), pending)
-    for text in _human_strings(only_report(bot)):
-        assert "*" not in text, text
-        assert "`" not in text, text
-        assert not SHORTCODE.search(text), text
+    assert_no_markup(only_report(run(spy(ALICE, BOB), pending)))
+
+
+@pytest.mark.usefixtures("_reboot_without_the_waiting")
+def test_the_reboot_report_carries_no_platform_markup() -> None:
+    """The Action most tempted by decoration — a Node's address in backticks — must resist it."""
+    bot = with_node_api(rebooting(comes_back_after=0), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="reboot", node_url=ALICE, confirmed=True)))
+    assert_no_markup(only_report(bot))
+
+
+def test_the_debug_screenshot_report_carries_no_platform_markup(tmp_path: Path) -> None:
+    """It names a filesystem path, which is where a backtick would feel most natural."""
+    image = tmp_path / "spongebob.gif"
+    image.write_bytes(GIF)
+
+    bot = debug_bot(image, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="screenshot", node_url=ALICE)))
+    assert_no_markup(only_report(bot))

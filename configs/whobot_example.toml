@@ -51,6 +51,19 @@ reachability_timeout_s = 5
 # for "are you there?", and 900s is the digest's whole budget for a Node.
 node_timeout_s = 30
 
+# How long a rebooted Node has to answer again before Whobot reports it as still down. Raise
+# it for a machine with a slow POST or one that fscks on boot. It shares the Reboot Action's
+# 360s budget with node_timeout_s and reachability_timeout_s, and Whobot refuses to start if
+# the three together leave the Action no time to report what it found.
+reboot_wait_s = 300
+
+# Development only. Screenshot is the one Action that needs a Node in front of a real
+# display — X11, KDE and `maim` — so on a laptop it can only ever fail. Point this at any
+# image file and the Screenshot Action answers with it and never calls the Node. The report
+# says as much, in a warning naming this setting, so nobody mistakes the picture for a Node.
+# Leave it out in production.
+# debug_screenshot_path = "/path/to/some-image.png"
+
 # The Node Registry. Whobot knows about exactly these Nodes — adding one is an edit here,
 # not a code change. Use each Node's address on the VPN; production Nodes listen on 9000.
 # Node *names* are deliberately not listed: Whobot reads them from each Node's

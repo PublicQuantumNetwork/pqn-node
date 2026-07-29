@@ -54,6 +54,13 @@ HEADER_LIMIT = 150
 FIELDS_PER_SECTION = 10
 """Slack's cap on a section's ``fields`` grid. Actions emit one Section; this splits it."""
 
+IMAGE_SUFFIXES = ((b"\x89PNG\r\n\x1a\n", "png"), (b"GIF8", "gif"), (b"\xff\xd8\xff", "jpg"))
+"""Magic numbers, so an upload can be named after what it actually is.
+
+Slack decides how to display a file from its *filename*, so a GIF sent as ``.png`` arrives
+broken. A screenshot is a PNG, but ``Report.image`` is only ``bytes``, and the debug
+screenshot makes it whatever file an operator pointed the config at."""
+
 STATUS_EMOJI = {
     Status.OK: ":white_check_mark:",
     Status.WARN: ":warning:",
@@ -111,6 +118,11 @@ def _section(text: str) -> Block:
 
 def _context(text: str) -> Block:
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+
+def _image_suffix(image: bytes) -> str:
+    """Name an uploaded image after what its bytes say it is, defaulting to PNG."""
+    return next((suffix for magic, suffix in IMAGE_SUFFIXES if image.startswith(magic)), "png")
 
 
 def _target_label(node: Node) -> str:
@@ -440,7 +452,7 @@ class WhobotSlack(Whobot):
                 channel=slack.channel,
                 thread_ts=slack.thread_ts,
                 file=image,
-                filename=f"{act.name}.png",
+                filename=f"{act.name}.{_image_suffix(image)}",
                 title=act.label,
             )
 

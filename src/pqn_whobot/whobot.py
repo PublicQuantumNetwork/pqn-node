@@ -78,9 +78,11 @@ This module must not reference a Chat Platform.
 
 import asyncio
 import logging
+import time
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 from typing import ClassVar
 
@@ -97,6 +99,7 @@ from pqn_whobot.actions import Status
 from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
+from pqn_whobot.config import REBOOT_TIMEOUT_S
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
@@ -108,6 +111,19 @@ logger = logging.getLogger(__name__)
 
 SHUTDOWN_GRACE_S = 10.0
 """How long a running Action gets to finish on shutdown before it is cancelled."""
+
+SCREENSHOT_TIMEOUT_S = 60.0
+"""Outer bound on one screenshot. The Node bounds the capture itself at 20s; the rest is
+for a large PNG crossing the VPN."""
+
+REBOOT_SETTLE_S = 15.0
+"""How long to wait after a reboot is acknowledged before polling starts.
+
+The Node answers and *then* begins shutting down, so a poll sent immediately reaches the API
+that is about to die and reports a machine that never went away."""
+
+REBOOT_POLL_INTERVAL_S = 5.0
+"""How often a rebooting Node is asked whether it is back."""
 
 
 class Whobot(ABC):
@@ -266,6 +282,155 @@ class Whobot(ABC):
         availability = await self._client(node).get_availability()
         return dict(availability.model_dump())
 
+    @action(
+        label="Screenshot",
+        description="A picture of what a Node's display is showing.",
+        scope=Scope.ONE,
+        timeout_s=SCREENSHOT_TIMEOUT_S,
+    )
+    async def screenshot(self, node: Node) -> Report:
+        """Capture the Node's display and hand the image back for the reply to carry.
+
+        This is the one thing no API probe can tell you: a Node whose every endpoint answers
+        correctly can still be sitting in front of a crashed kiosk or a login screen.
+        """
+        if self.settings.debug_screenshot_path is not None:
+            return self._debug_screenshot(node, self.settings.debug_screenshot_path)
+
+        try:
+            image = await self._client(node).get_screenshot()
+        except NodeApiError as e:
+            return Report(
+                status=Status.FAIL,
+                title=f"Screenshot — {node.name}",
+                summary="The Node did not return a screenshot.",
+                sections=[Section(error=str(e))],
+            )
+
+        return Report(
+            status=Status.OK,
+            title=f"Screenshot — {node.name}",
+            summary=f"{node.api_url} — {len(image) / 1024:,.0f} KB",
+            image=image,
+        )
+
+    @staticmethod
+    def _debug_screenshot(node: Node, path: Path) -> Report:
+        """Answer with a file from disk instead of calling the Node.
+
+        Screenshot is the one Action that cannot be exercised without a Node in front of a
+        real display, so this exists to drive the whole path — the Action, the image on the
+        result, the upload — from a laptop.
+
+        It says so loudly. An image that is not of the Node is worse than no image at all if
+        anyone mistakes it for one, so the report is a ``WARN`` naming the setting that
+        produced it.
+        """
+        try:
+            image = path.read_bytes()
+        except OSError as e:
+            return Report(
+                status=Status.FAIL,
+                title=f"Screenshot — {node.name}",
+                summary="debug_screenshot_path is set in whobot.toml, and that file could not be read.",
+                sections=[Section(error=str(e))],
+            )
+
+        return Report(
+            status=Status.WARN,
+            title=f"Screenshot — {node.name}",
+            summary="This is not the Node's display. Whobot answered from a file and never called the Node.",
+            image=image,
+            notes=[f"debug_screenshot_path = {path}. Remove it from whobot.toml to screenshot the Node itself."],
+        )
+
+    @action(
+        label="Reboot",
+        description="Reboot a Node's host, then wait for its API to answer again.",
+        scope=Scope.ONE,
+        destructive=True,
+        timeout_s=REBOOT_TIMEOUT_S,
+    )
+    async def reboot(self, node: Node) -> Report:
+        """Reboot the Node's host and report whether it came back.
+
+        Recovery is unattended: the machine autologs in, KDE autostart runs the Node's start
+        script, and the API and kiosk come back on their own. The report is the point — an
+        operator who asked for a reboot and got only "requested" has learnt nothing they
+        could not have assumed, so this waits and says either how long it took or that it is
+        still down.
+        """
+        title = f"Reboot — {node.name}"
+        try:
+            ack = await self._client(node).reboot()
+        except NodeApiError as e:
+            return Report(
+                status=Status.FAIL,
+                title=title,
+                summary="The Node did not accept the reboot, so nothing was rebooted.",
+                sections=[Section(error=str(e))],
+            )
+
+        waited = self.settings.reboot_wait_s
+        elapsed = await self._wait_until_back(node)
+        if elapsed is None:
+            return Report(
+                status=Status.FAIL,
+                title=title,
+                summary=f"The Node has not answered in the {waited / 60:.0f} minutes since it was rebooted.",
+                sections=[
+                    Section(
+                        fields=[
+                            Field(name="Reboot", value=ack.detail or "scheduled", status=Status.OK),
+                            Field(name="Node API", value=f"still down after {waited:.0f}s", status=Status.FAIL),
+                        ]
+                    )
+                ],
+                notes=["A reboot does not restart the Router or the Instrument Providers; those are another machine."],
+            )
+
+        return Report(
+            status=Status.OK,
+            title=title,
+            summary=f"{node.api_url} is back, {elapsed:.0f}s after the reboot was requested.",
+            sections=[
+                Section(
+                    fields=[
+                        Field(name="Reboot", value=ack.detail or "scheduled", status=Status.OK),
+                        Field(name="Node API", value=f"answering after {elapsed:.0f}s", status=Status.OK),
+                    ]
+                )
+            ],
+        )
+
+    async def _wait_until_back(self, node: Node) -> float | None:
+        """Poll a rebooting Node until it answers, returning how long that took.
+
+        ``None`` means it never did within ``reboot_wait_s``, which is what the guardrail is
+        actually for: the confirm step protects against rebooting the wrong Node, and this
+        protects against one that does not return. How long to wait is configuration because
+        it is site-specific; the settle period and the poll interval are not, because they
+        describe how a host shuts down rather than how long an operator is willing to wait.
+
+        Each poll is bounded by ``reachability_timeout_s`` rather than the Action's timeout,
+        because "are you there?" is exactly the question, and a host that is off drops
+        packets rather than refusing them — an unbounded poll would hang until the whole
+        invocation timed out.
+        """
+        started = time.monotonic()
+        await asyncio.sleep(REBOOT_SETTLE_S)
+        client = self._client(node, self.settings.reachability_timeout_s)
+
+        while time.monotonic() - started < self.settings.reboot_wait_s:
+            try:
+                await client.get_config()
+            except NodeApiError:
+                await asyncio.sleep(REBOOT_POLL_INTERVAL_S)
+                continue
+            return time.monotonic() - started
+
+        return None
+
     # ----------------------------------------------------------------------------------
     # The flow. The single entry point from any Chat Platform.
     # ----------------------------------------------------------------------------------
@@ -412,9 +577,13 @@ class Whobot(ABC):
     # Helpers. None of these is an Action, so none can be invoked from a Chat Platform.
     # ----------------------------------------------------------------------------------
 
-    def _client(self, node: Node) -> NodeClient:
-        """Open a client for one Node, bounded by the timeout an Action's calls get."""
-        return NodeClient(node.api_url, self.settings.node_timeout_s)
+    def _client(self, node: Node, timeout_s: float | None = None) -> NodeClient:
+        """Open a client for one Node, bounded by the timeout an Action's calls get.
+
+        ``timeout_s`` overrides that where a call is asking a different question: polling a
+        rebooting Node wants the "are you there?" bound, not the Action's.
+        """
+        return NodeClient(node.api_url, self.settings.node_timeout_s if timeout_s is None else timeout_s)
 
     def _menu(self) -> list[Action]:
         """Every Action, in the order they are declared. The menu is the class body."""
