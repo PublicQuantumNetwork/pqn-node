@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
-from pqn_node.api.deps import get_rotator
+from pqn_node.api.hardware import find_rotator
 from pqn_node.api.peers import measure_coincidences
 from pqn_node.api.peers import require_follower_address
 from pqn_node.constants import BasisBool
@@ -43,7 +43,7 @@ async def _qkd(
     if follower_node_address is None:
         follower_node_address = require_follower_address()
     logger.debug("Starting QKD")
-    hwp = get_rotator(settings.qkd_settings.hwp)
+    hwp = find_rotator(settings.qkd_settings.hwp)
 
     counts = []
     for basis in state.qkd_leader_basis_list:
@@ -129,7 +129,7 @@ async def qkd(
 
 @router.post("/single_bit")
 async def request_qkd_single_pass(state: StateDep) -> bool:
-    hwp = get_rotator(settings.qkd_settings.request_hwp)
+    hwp = find_rotator(settings.qkd_settings.request_hwp)
 
     # Check if we have basis choices available
     if state.qkd_single_bit_current_index >= len(state.qkd_follower_basis_list):

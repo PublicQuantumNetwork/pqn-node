@@ -14,14 +14,13 @@ from pydantic import BaseModel
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
-from pqn_node.api.deps import get_rotator
-from pqn_node.api.deps import move_to_polarization
+from pqn_node.api.hardware import find_rotator
+from pqn_node.api.hardware import move_to_polarization
 from pqn_node.api.peers import fetch_node_name
 from pqn_node.api.peers import measure_coincidences
 from pqn_node.api.peers import require_follower_address
 from pqn_node.core.config import chsh_progress_event
 from pqn_node.core.config import settings
-from pqn_node.core.sweep import SweepResult
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +31,36 @@ class ChshResult(BaseModel):
     expectation_values: list[float]
     expectation_errors: list[float]
     expectation_values_sign_fixed: list[float]
+
+
+class SweepResult(BaseModel):
+    """An Angle Sweep: the leader's polarization angles and the coincidences counted at each.
+
+    Angles are polarization angles, the ones a plot's x axis shows; the half waveplate is
+    moved to half of each, which ``move_to_polarization`` takes care of.
+    """
+
+    leader_name: str
+    follower_name: str
+    follower_angle: float
+    step_deg: float
+    integration_time_s: float
+    angles: list[float]
+    coincidences: list[int]
+
+    @property
+    def min_coincidences(self) -> int:
+        return min(self.coincidences, default=0)
+
+    @property
+    def max_coincidences(self) -> int:
+        return max(self.coincidences, default=0)
+
+    @property
+    def visibility(self) -> float:
+        """Fringe visibility, (max - min) / (max + min). Zero when nothing was counted."""
+        low, high = self.min_coincidences, self.max_coincidences
+        return 0.0 if high + low == 0 else (high - low) / (high + low)
 
 
 router = APIRouter(prefix="/chsh", tags=["chsh"])
@@ -94,7 +123,7 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
     chsh_progress_event.set()
 
     # TODO: Check if settings.chsh_settings.hwp is set before even trying to get the device.
-    hwp = get_rotator(settings.chsh_settings.hwp)
+    hwp = find_rotator(settings.chsh_settings.hwp)
 
     expectation_values = []
     expectation_errors = []
@@ -182,7 +211,7 @@ async def chsh(
 
 def _move_request_hwp(angle: float) -> bool:
     """Move this Node's requested waveplate, the one a leader steers, to a polarization angle."""
-    move_to_polarization(get_rotator(settings.chsh_settings.request_hwp), angle)
+    move_to_polarization(find_rotator(settings.chsh_settings.request_hwp), angle)
     logger.info("moving waveplate", extra={"angle": angle})
     return True
 
@@ -211,7 +240,7 @@ async def sweep(
     Returns the coincidence count at every step, for plotting a fringe.
     """
     follower_node_address = require_follower_address()
-    hwp = get_rotator(settings.chsh_settings.hwp)
+    hwp = find_rotator(settings.chsh_settings.hwp)
 
     r = await http_client.post(f"http://{follower_node_address}/chsh/request-angle", params={"angle": follower_angle})
     if r.status_code != status.HTTP_200_OK:

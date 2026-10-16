@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
+from pqn_node.api.routes.chsh import SweepResult
 from pqn_node.constants import Polarization
-from pqn_node.core.sweep import SweepResult
 
 # One colour per setting, so each line on a plot matches the letter under it.
 POLARIZATION_COLORS: dict[Polarization, str] = {

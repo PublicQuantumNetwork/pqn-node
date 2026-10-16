@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from pqn_node.api import deps
+from pqn_node.api import hardware
 from pqn_node.api.deps import get_http_client
 from pqn_node.api.routes import system
 from pqn_node.api.routes.health import ComponentStatus
@@ -163,7 +163,7 @@ def waveplate(monkeypatch: pytest.MonkeyPatch) -> FakeWaveplate:
         def get_device(self, *_: object) -> FakeWaveplate:
             return plate
 
-    monkeypatch.setattr(deps, "Client", FakeRouterClient)
+    monkeypatch.setattr(hardware, "Client", FakeRouterClient)
     return plate
 
 

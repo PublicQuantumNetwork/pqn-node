@@ -3,8 +3,8 @@
 Every call carries a timeout, and every failure — refused connection, HTTP error,
 unparseable body — arrives as a ``NodeApiError``.
 
-``HealthStatus`` and ``ChshResult`` are imported from the route modules that produce them, so
-there is one definition of each rather than a copy that can drift. The cost is that importing
+``HealthStatus``, ``ChshResult`` and ``SweepResult`` are imported from the route modules that
+produce them, so there is one definition of each rather than a copy that can drift. The cost is that importing
 this pulls in a FastAPI route module and everything it imports; extracting the shared response
 models into a module of their own is a later refactor.
 """
@@ -16,9 +16,9 @@ from pydantic import BaseModel
 from pydantic import ValidationError
 
 from pqn_node.api.routes.chsh import ChshResult
+from pqn_node.api.routes.chsh import SweepResult
 from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
-from pqn_node.core.sweep import SweepResult
 
 logger = logging.getLogger(__name__)
 

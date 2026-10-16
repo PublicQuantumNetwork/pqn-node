@@ -5,7 +5,7 @@ from fastapi import APIRouter
 from fastapi import Query
 from pqn_hardware.measurement import MeasurementConfig
 
-from pqn_node.api.deps import get_timetagger
+from pqn_node.api.hardware import find_timetagger
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ async def measure_correlation(
         channel1=channel1,
         channel2=channel2,
     )
-    tagger = get_timetagger()
+    tagger = find_timetagger()
     count = tagger.measure_correlation(
         mconf.channel1,
         mconf.channel2,
@@ -42,7 +42,7 @@ async def count_singles(
     integration_time_s: float,
     channels: Annotated[list[int], Query()],
 ) -> list[int]:
-    tagger = get_timetagger()
+    tagger = find_timetagger()
     counts = tagger.count_singles(channels, integration_time_s=integration_time_s)
 
     logger.info("Measured singles counts: %s", counts)

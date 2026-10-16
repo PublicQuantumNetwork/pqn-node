@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from pqn_node.api.routes.chsh import SweepResult
 from pqn_node.constants import Polarization
 from pqn_node.constants import QKDAngleValuesHWP
-from pqn_node.core.sweep import SweepResult
 from pqn_whobot.sweep_report import POLARIZATION_TICKS
 from pqn_whobot.sweep_report import append_sweep_csv
 from pqn_whobot.sweep_report import describe_angle
