@@ -9,6 +9,7 @@ from pqn_hardware.drivers.rotaryencoder import RotaryEncoderInstrument
 from pqn_hardware.drivers.rotaryencoder import SerialRotaryEncoder
 from pqn_hardware.network.client import Client
 
+from pqn_node.api.hardware import router_client
 from pqn_node.core.config import NodeState
 from pqn_node.core.config import get_state
 from pqn_node.core.config import logger
@@ -24,9 +25,7 @@ ClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 
 
 async def get_instrument_client() -> AsyncGenerator[Client, None]:
-    async with Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name
-    ) as client:
+    async with router_client() as client:
         yield client
 
 

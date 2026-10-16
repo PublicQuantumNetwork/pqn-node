@@ -14,6 +14,7 @@ because dispatch consults the registry over HTTP on every ``scope=ONE`` click.
 """
 
 import asyncio
+import csv
 import json
 import logging
 import re
@@ -867,6 +868,12 @@ def test_no_action_output_contains_platform_markup(pending: PendingInvocation) -
     assert_no_markup(only_report(run(spy(ALICE, BOB), pending)))
 
 
+def test_an_angle_sweeps_output_carries_no_platform_markup() -> None:
+    bot = with_node_api(node_api(), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="angle_sweep", node_url=ALICE, params=SWEEP_FORM)))
+    assert_no_markup(only_report(bot))
+
+
 def test_a_check_ups_output_carries_no_platform_markup() -> None:
     """The result with the most strings in it, and the only one with two levels of them."""
     assert_no_markup(checked(with_node_api(node_api(), ALICE)))
@@ -920,6 +927,22 @@ CHSH = {
     "expectation_values_sign_fixed": [0.7, 0.65],
 }
 
+SWEEP_FORM: dict[str, object] = {
+    "follower_polarization": "D",
+    "custom_angle": 0.0,
+    "step_deg": 5.0,
+    "integration_time_s": 2.0,
+}
+SWEEP = {
+    "leader_name": "alice",
+    "follower_name": "bob",
+    "follower_angle": 0.0,
+    "step_deg": 90.0,
+    "integration_time_s": 2.0,
+    "angles": [0.0, 90.0, 180.0, 270.0],
+    "coincidences": [100, 10, 100, 10],
+}
+
 ALL_GAMES_ON = {"chsh": True, "qf": True, "ssm": True}
 
 
@@ -935,6 +958,7 @@ def node_api(
         "/health/": HEALTHY,
         "/games/availability": availability,
         "/chsh/": CHSH,
+        "/chsh/sweep": SWEEP,
         "/rng/fortune": [42, 137],
     }
 
@@ -1583,3 +1607,73 @@ def test_the_schedule_action_refuses_what_the_config_would(
     assert report.status is Status.FAIL
     assert (bot.settings.schedule_hour, bot.settings.schedule_minute) == (7, 0)
     assert not Path("whobot.toml").exists(), "a refused schedule must not touch the file"
+
+
+# --------------------------------------------------------------------------------------
+# angle_sweep: one call to the leader, a plot back.
+# --------------------------------------------------------------------------------------
+
+
+def _sweep_request(form: dict[str, object]) -> httpx.Request:
+    """Run an Angle Sweep from this form and return the call it made to the leader."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(node_api(seen=seen), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="angle_sweep", node_url=ALICE, params=form)))
+    return next(r for r in seen if r.url.path == "/chsh/sweep")
+
+
+def test_angle_sweep_sends_the_form_values_to_the_leader() -> None:
+    request = _sweep_request(SWEEP_FORM)
+
+    assert request.method == "POST"
+    assert float(request.url.params["step_deg"]) == SWEEP_FORM["step_deg"]
+    assert float(request.url.params["integration_time_s"]) == SWEEP_FORM["integration_time_s"]
+
+
+@pytest.mark.parametrize(("polarization", "angle"), [("H", 0.0), ("D", 45.0), ("V", 90.0), ("A", 315.0)])
+def test_a_named_polarization_pins_the_follower_at_its_angle(polarization: str, angle: float) -> None:
+    request = _sweep_request({**SWEEP_FORM, "follower_polarization": polarization, "custom_angle": 37.5})
+
+    assert float(request.url.params["follower_angle"]) == angle
+
+
+def test_a_custom_polarization_pins_the_follower_at_the_custom_angle() -> None:
+    custom_angle = 37.5
+    request = _sweep_request({**SWEEP_FORM, "follower_polarization": "custom", "custom_angle": custom_angle})
+
+    assert float(request.url.params["follower_angle"]) == custom_angle
+
+
+def test_angle_sweep_plots_the_counts_and_reports_visibility() -> None:
+    bot = with_node_api(node_api(), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="angle_sweep", node_url=ALICE, params=SWEEP_FORM)))
+    result = only_report(bot)
+
+    assert result.status is Status.OK
+    assert "alice (leader)" in result.title
+    assert "bob (follower)" in result.title
+    assert result.image is not None
+    assert result.image.startswith(b"\x89PNG\r\n\x1a\n")
+    fields = {f.name: f.value for f in result.sections[0].fields}
+    assert fields["Visibility"] == f"{90 / 110:.4f}"
+
+
+def test_angle_sweep_appends_its_data_beside_the_config() -> None:
+    """The flow tests run in a temporary directory, so this is the file a real run would write."""
+    bot = with_node_api(node_api(), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="angle_sweep", node_url=ALICE, params=SWEEP_FORM)))
+
+    with Path("whobot_sweeps.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert [int(row["coincidences"]) for row in rows] == SWEEP["coincidences"]
+    assert any("whobot_sweeps.csv" in note for note in only_report(bot).notes)
+
+
+def test_a_sweep_the_leader_refuses_is_a_fail_with_its_reason() -> None:
+    bot = with_node_api(node_api(refuse={"/chsh/sweep": 503}), ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="angle_sweep", node_url=ALICE, params=SWEEP_FORM)))
+    result = only_report(bot)
+
+    assert result.status is Status.FAIL
+    assert result.image is None
+    assert "not having it" in (result.sections[0].error or "")

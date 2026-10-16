@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
+from enum import Enum
 from enum import StrEnum
 from typing import Any
 from typing import TypeVar
@@ -212,10 +213,22 @@ WIDGET_TYPES: tuple[type, ...] = (bool, float, int)
 """Parameter types the form generator can render: ``bool`` a checkbox, ``float`` and ``int`` a
 number input — which for an ``int`` refuses decimals, since an hour of the day has none.
 
+Any ``Enum`` subclass is accepted besides these and rendered as a dropdown of its members (see
+``is_choice``); an enum is a family of types rather than one, so it cannot be an entry here.
+
 The scan rejects any other type by name, so an unsupported parameter fails at import with a
-message rather than producing an empty form. Adding ``str`` or ``Literal``/enum is one entry
-here and one branch in the Chat Platform's form renderer.
+message rather than producing an empty form. Adding ``str`` is one entry here and one branch
+in the Chat Platform's form renderer.
 """
+
+
+def is_choice(annotation: object) -> bool:
+    """Whether a parameter is a pick from a fixed set: an ``Enum``, rendered as a dropdown.
+
+    The form carries each member's ``value``, which ``coerce_params`` turns back into the
+    member by calling the enum on it.
+    """
+    return isinstance(annotation, type) and issubclass(annotation, Enum)
 
 
 @dataclass(frozen=True)
@@ -423,16 +436,21 @@ def _parse_parameters(name: str, signature: inspect.Signature, scope: Scope) -> 
         if parameter.annotation is inspect.Parameter.empty:
             msg = f"parameter {parameter.name!r} has no type annotation, so no widget can be chosen for it"
             raise _fail(name, msg)
-        if parameter.annotation not in WIDGET_TYPES:
-            supported = ", ".join(widget.__name__ for widget in WIDGET_TYPES)
+        if parameter.annotation not in WIDGET_TYPES and not is_choice(parameter.annotation):
+            supported = ", ".join(widget.__name__ for widget in WIDGET_TYPES) + ", an Enum"
             msg = (
                 f"parameter {parameter.name!r} is {parameter.annotation!r}, which has no widget; supported: {supported}"
             )
             raise _fail(name, msg)
-        default = parameter.default if parameter.default is not inspect.Parameter.empty else parameter.annotation()
+        default = parameter.default if parameter.default is not inspect.Parameter.empty else _zero(parameter.annotation)
         parameters.append(Parameter(name=parameter.name, annotation=parameter.annotation, default=default))
 
     return tuple(parameters)
+
+
+def _zero(annotation: type) -> object:
+    """Pick the starting value of a parameter with no default: the type's zero, or an enum's first member."""
+    return next(iter(annotation)) if is_choice(annotation) else annotation()  # type: ignore[call-overload]
 
 
 def _parse_action(name: str, method: ActionMethod, meta: ActionMeta) -> Action:

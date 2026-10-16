@@ -8,6 +8,7 @@ Slack. That the scan also runs on class creation is pinned in the ``whobot.py`` 
 
 import asyncio
 import json
+from enum import StrEnum
 
 import pytest
 
@@ -214,6 +215,40 @@ def test_scope_none_taking_a_node_is_rejected() -> None:
 
     with pytest.raises(ActionDeclarationError, match="scope=NONE must not take a 'node'"):
         scan_actions(Bad)
+
+
+class Colour(StrEnum):
+    RED = "red"
+    BLUE = "blue"
+
+
+def test_an_enum_parameter_is_accepted_and_starts_on_its_default() -> None:
+    class Picker:
+        @action(label="Pick")
+        async def pick(self, *, colour: Colour = Colour.BLUE) -> Report:
+            return OK
+
+    parameter = scan_actions(Picker)["pick"].parameters[0]
+    assert parameter.annotation is Colour
+    assert parameter.default is Colour.BLUE
+
+
+def test_an_enum_without_a_signature_default_starts_on_its_first_member() -> None:
+    class Picker:
+        @action(label="Pick")
+        async def pick(self, *, colour: Colour) -> Report:
+            return OK
+
+    assert scan_actions(Picker)["pick"].parameters[0].default is Colour.RED
+
+
+def test_an_enum_value_from_a_payload_coerces_back_to_the_member() -> None:
+    class Picker:
+        @action(label="Pick")
+        async def pick(self, *, colour: Colour = Colour.RED) -> Report:
+            return OK
+
+    assert scan_actions(Picker)["pick"].coerce_params({"colour": "blue"}) == {"colour": Colour.BLUE}
 
 
 def test_a_parameter_type_with_no_widget_is_rejected_by_name() -> None:

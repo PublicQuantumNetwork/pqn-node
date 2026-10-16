@@ -40,6 +40,7 @@ dependencies = [
 whobot = [
     "slack-bolt>=1.18",
     "aiohttp>=3.9",
+    "matplotlib>=3.8",
 ]
 
 [project.scripts]

@@ -171,3 +171,6 @@ config.toml
 
 # Whobot's config: holds the Slack tokens.
 whobot.toml
+
+# Every Angle Sweep Whobot has run, kept beside its config.
+whobot_sweeps.csv

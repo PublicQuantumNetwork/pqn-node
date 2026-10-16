@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from slack_sdk.errors import SlackApiError
 
+from pqn_node.constants import Polarization
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
 from pqn_whobot.actions import Field
@@ -418,6 +419,36 @@ def test_an_int_number_input_reads_back_as_an_int() -> None:
     }
 
     assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"hour": 21, "minute": 15}  # noqa: SLF001
+
+
+def sweep_action() -> Any:
+    return scan_actions(WhobotSlack)["angle_sweep"]
+
+
+def test_an_enum_parameter_becomes_a_dropdown_above_the_numbers() -> None:
+    """The custom angle only matters for one pick, so it reads below the pick."""
+    blocks = WhobotSlack._form_blocks(sweep_action(), {})  # noqa: SLF001
+
+    assert [b["element"]["type"] for b in blocks] == ["static_select"] + ["number_input"] * 3
+    select = blocks[0]["element"]
+    assert [o["text"]["text"] for o in select["options"]] == ["H (0°)", "D (45°)", "V (90°)", "A (315°)", "Custom"]
+    assert [o["value"] for o in select["options"]] == ["H", "D", "V", "A", "custom"]
+    assert select["initial_option"]["value"] == "H"
+
+
+def test_a_dropdown_opens_on_the_value_it_was_given() -> None:
+    blocks = WhobotSlack._form_blocks(sweep_action(), {"follower_polarization": "V"})  # noqa: SLF001
+
+    assert blocks[0]["element"]["initial_option"]["value"] == "V"
+
+
+def test_a_dropdown_pick_reads_back_as_the_enum_member() -> None:
+    act = sweep_action()
+    block = _param_block("follower_polarization")
+    state = {block: {block: {"type": "static_select", "selected_option": {"value": "custom"}}}}
+
+    params = act.coerce_params(WhobotSlack._read_form(act, state))  # noqa: SLF001
+    assert params["follower_polarization"] is Polarization.CUSTOM
 
 
 def test_an_action_with_no_booleans_renders_no_checkbox_group() -> None:

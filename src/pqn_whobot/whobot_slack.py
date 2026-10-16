@@ -21,8 +21,10 @@ from collections.abc import Iterator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace
+from enum import Enum
 from functools import singledispatchmethod
 from typing import Any
+from typing import cast
 
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.webhook.async_client import AsyncWebhookClient
@@ -40,6 +42,7 @@ from pqn_whobot.actions import Section
 from pqn_whobot.actions import Status
 from pqn_whobot.actions import decode
 from pqn_whobot.actions import encode
+from pqn_whobot.actions import is_choice
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.config import config_path
 from pqn_whobot.registry import Node
@@ -101,6 +104,11 @@ PARAMS_BLOCK = "whobot_params_block"
 def _param_block(name: str) -> str:
     """Name the block a single-parameter widget lives in; Slack echoes it back as the answer's key."""
     return f"whobot_param_{name}"
+
+
+def _param_label(parameter: Parameter) -> str:
+    """Turn a parameter's name into a form label: ``step_deg`` becomes "Step Deg"."""
+    return parameter.name.replace("_", " ").title()
 
 
 @dataclass(frozen=True)
@@ -272,7 +280,8 @@ class WhobotSlack(Whobot):
         takes its default in ``coerce_params``, and switches the flag back *on*.
 
         A number input needs no floor: an empty one is genuinely "no answer", and leaving it out
-        lets ``coerce_params`` supply the default.
+        lets ``coerce_params`` supply the default. A dropdown always has a pick, since it opens
+        on one, and reports it as ``selected_option``.
         """
         params: dict[str, object] = {
             parameter.name: False for parameter in act.parameters if parameter.annotation is bool
@@ -282,11 +291,15 @@ class WhobotSlack(Whobot):
                 params[option["value"]] = True
 
         for parameter in act.parameters:
-            if parameter.annotation not in NUMBER_TYPES:
-                continue
-            typed = (values.get(_param_block(parameter.name), {}).get(_param_block(parameter.name)) or {}).get("value")
-            if typed:
-                params[parameter.name] = typed
+            element = values.get(_param_block(parameter.name), {}).get(_param_block(parameter.name)) or {}
+            if is_choice(parameter.annotation):
+                picked = (element.get("selected_option") or {}).get("value")
+                if picked:
+                    params[parameter.name] = picked
+            elif parameter.annotation in NUMBER_TYPES:
+                typed = element.get("value")
+                if typed:
+                    params[parameter.name] = typed
         return params
 
     async def _safely(self, pending: PendingInvocation, reply: SlackReply) -> None:
@@ -394,12 +407,15 @@ class WhobotSlack(Whobot):
         """Generate the whole form from the Action's parameters.
 
         Every ``bool`` shares one checkbox group, because "which of these are on" is one
-        question; every number gets an input of its own, since Slack keys a submitted value by
-        the block it was in. The scan has already refused any parameter type without a mapping,
-        so a parameter reaching here that is neither is a bug in the scan rather than a bad Action.
+        question; every dropdown and every number gets an input of its own, since Slack keys a
+        submitted value by the block it was in. Dropdowns come before numbers, so a number that
+        only matters for one pick (a custom angle) sits below the pick. The scan has already
+        refused any parameter type without a mapping, so a parameter reaching here that is none
+        of these is a bug in the scan rather than a bad Action.
         """
         booleans = [p for p in act.parameters if p.annotation is bool]
         blocks = [cls._checkbox_block(booleans, initial)] if booleans else []
+        blocks += [cls._select_block(p, initial) for p in act.parameters if is_choice(p.annotation)]
         blocks += [cls._number_block(p, initial) for p in act.parameters if p.annotation in NUMBER_TYPES]
         return blocks
 
@@ -425,6 +441,29 @@ class WhobotSlack(Whobot):
         }
 
     @staticmethod
+    def _select_block(parameter: Parameter, initial: dict[str, object]) -> Block:
+        """Render one ``Enum`` parameter as a dropdown of its members, opened on its starting pick.
+
+        Each option shows the member's ``label`` when it has one ("D (45°)"), else its name.
+        """
+        members = list(cast("type[Enum]", parameter.annotation))
+        options = [_option(str(getattr(member, "label", member.name)), str(member.value)) for member in members]
+        start = initial.get(parameter.name, parameter.default)
+        start_value = str(start.value if isinstance(start, Enum) else start)
+        chosen = next((option for option in options if option["value"] == start_value), options[0])
+        return {
+            "type": "input",
+            "block_id": _param_block(parameter.name),
+            "label": {"type": "plain_text", "text": _param_label(parameter)},
+            "element": {
+                "type": "static_select",
+                "action_id": _param_block(parameter.name),
+                "options": options,
+                "initial_option": chosen,
+            },
+        }
+
+    @staticmethod
     def _number_block(parameter: Parameter, initial: dict[str, object]) -> Block:
         """Render one numeric parameter as a number input, opened on its starting value.
 
@@ -435,7 +474,7 @@ class WhobotSlack(Whobot):
             "type": "input",
             "block_id": _param_block(parameter.name),
             "optional": True,
-            "label": {"type": "plain_text", "text": parameter.name.replace("_", " ").title()},
+            "label": {"type": "plain_text", "text": _param_label(parameter)},
             "element": {
                 "type": "number_input",
                 "action_id": _param_block(parameter.name),
