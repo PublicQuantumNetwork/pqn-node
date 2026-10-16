@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from pqn_node.api.routes.chsh import ChshResult
 from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
+from pqn_node.core.sweep import SweepResult
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,24 @@ class NodeClient:
         params = {"timetagger_address": timetagger_address}
         payload = await self._send_json("POST", "/chsh/", timeout_s, list(basis), params)
         return self._validated(ChshResult, payload, "a CHSH result")
+
+    async def run_sweep(
+        self,
+        timetagger_address: str,
+        follower_angle: float,
+        step_deg: float,
+        integration_time_s: float,
+        timeout_s: float,
+    ) -> SweepResult:
+        """Pin the follower's waveplate and sweep this Node's through a full circle, counting coincidences."""
+        params = {
+            "timetagger_address": timetagger_address,
+            "follower_angle": str(follower_angle),
+            "step_deg": str(step_deg),
+            "integration_time_s": str(integration_time_s),
+        }
+        payload = await self._send_json("POST", "/chsh/sweep", timeout_s, params=params)
+        return self._validated(SweepResult, payload, "a sweep result")
 
     async def run_fortune(self, timetagger_address: str, timeout_s: float) -> list[int]:
         """Run one Quantum Fortune, returning the number each channel drew.

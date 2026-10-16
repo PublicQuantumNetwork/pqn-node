@@ -94,6 +94,11 @@ from zoneinfo import ZoneInfo
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
 from pqn_node.core.config import GamesAvailability
+from pqn_node.core.sweep import Polarization
+from pqn_node.core.sweep import append_sweep_csv
+from pqn_node.core.sweep import describe_angle
+from pqn_node.core.sweep import plot_sweep
+from pqn_node.core.sweep import visibility
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
@@ -110,6 +115,7 @@ from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
 from pqn_whobot.config import ConfigWriteError
 from pqn_whobot.config import WhobotSettings
+from pqn_whobot.config import config_path
 from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
@@ -147,6 +153,16 @@ time. When the target is nearer than this, the tick sleeps exactly as long as is
 def one_game_budget(settings: WhobotSettings) -> float:
     """How long an Action that plays one Game may take: the Game, plus the call that starts it."""
     return settings.node_timeout_s + settings.per_game_timeout_s
+
+
+def sweep_csv_path() -> Path:
+    """Where every Angle Sweep's data is kept: beside ``whobot.toml``, untracked like it."""
+    return config_path().parent / "whobot_sweeps.csv"
+
+
+def sweep_budget(settings: WhobotSettings) -> float:
+    """How long an Angle Sweep may take: the sweep, plus the call that starts it."""
+    return settings.node_timeout_s + settings.sweep_timeout_s
 
 
 def whole_digest_budget(settings: WhobotSettings) -> float:
@@ -374,6 +390,75 @@ class Whobot(ABC):
         """Open the form on the angles an unattended run would use, so config is the starting point."""
         angle_a, angle_b = self.settings.basis
         return {"angle_a": angle_a, "angle_b": angle_b}
+
+    @action(
+        label="Angle Sweep",
+        description="Pin the follower at H, D, V, A or any angle, sweep this Node's through 0-360°, and plot coincidences.",
+        scope=Scope.ONE,
+        timeout_s=sweep_budget,
+    )
+    async def angle_sweep(
+        self,
+        node: Node,
+        *,
+        follower_polarization: Polarization = Polarization.H,
+        custom_angle: float = 0.0,
+        step_deg: float = 10.0,
+        integration_time_s: float = 1.0,
+    ) -> Report:
+        """Sweep the leader's polarization angle against a fixed follower, and plot the fringe.
+
+        ``custom_angle`` is used only when ``follower_polarization`` is ``CUSTOM``.
+        """
+        title = f"Angle Sweep — {node.name}"
+        follower_angle = follower_polarization.angle
+        if follower_angle is None:
+            follower_angle = custom_angle
+        try:
+            result = await self._client(node).run_sweep(
+                self.settings.timetagger_address,
+                follower_angle,
+                step_deg,
+                integration_time_s,
+                self.settings.sweep_timeout_s,
+            )
+        except NodeApiError as e:
+            return Report(
+                status=Status.FAIL,
+                title=title,
+                summary="The sweep did not complete.",
+                sections=[Section(error=str(e))],
+            )
+
+        notes = []
+        csv_path = sweep_csv_path()
+        try:
+            append_sweep_csv(csv_path, result, integration_time_s, datetime.now(UTC))
+        except (OSError, ValueError) as e:
+            logger.exception("%s: could not save the sweep to %s", node.name, csv_path)
+            notes.append(f"The data was not saved to {csv_path}: {e}")
+        else:
+            notes.append(f"Data appended to {csv_path}")
+
+        return Report(
+            status=Status.OK,
+            title=f"Angle Sweep — {result.leader_name} (leader) vs {result.follower_name} (follower)",
+            summary=(
+                f"{result.leader_name} swept 0-360°, {result.follower_name} pinned at "
+                f"{describe_angle(follower_angle)}, {len(result.angles)} points of {integration_time_s:g}s"
+            ),
+            sections=[
+                Section(
+                    fields=[
+                        Field(name="Min coincidences", value=str(min(result.coincidences, default=0))),
+                        Field(name="Max coincidences", value=str(max(result.coincidences, default=0))),
+                        Field(name="Visibility", value=f"{visibility(result.coincidences):.4f}"),
+                    ]
+                )
+            ],
+            image=plot_sweep(result, integration_time_s),
+            notes=notes,
+        )
 
     @action(
         label="Run Quantum Fortune",

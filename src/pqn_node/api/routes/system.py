@@ -9,6 +9,7 @@ inherits ``DISPLAY`` and ``XAUTHORITY`` — nothing here reconstructs that envir
 import asyncio
 import logging
 
+import httpx
 from fastapi import APIRouter
 from fastapi import BackgroundTasks
 from fastapi import HTTPException
@@ -110,3 +111,16 @@ async def get_node_state(state: StateDep) -> NodeState:
 async def get_node_settings() -> Settings:
     """Dump the settings the Node is actually running with, including any applied at runtime."""
     return settings
+
+
+async def fetch_node_name(http_client: httpx.AsyncClient, node_address: str) -> str:
+    """Ask another Node what it is called, falling back to its address.
+
+    Only ever a label, so a Node that will not say is no reason to fail whatever wanted it.
+    """
+    try:
+        r = await http_client.get(f"http://{node_address}/system/settings")
+        name = r.json().get("node_name") if r.status_code == status.HTTP_200_OK else None
+    except (httpx.HTTPError, ValueError, AttributeError):
+        name = None
+    return name or node_address

@@ -6,13 +6,17 @@ Whether the capture is a real desktop and whether the host comes back are
 environmental and get verified on a live Node.
 """
 
+from collections.abc import AsyncGenerator
 from collections.abc import Iterator
 from http import HTTPStatus
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from pqn_node.api.deps import get_http_client
+from pqn_node.api.routes import chsh
 from pqn_node.api.routes import system
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import _last_probe
@@ -133,3 +137,131 @@ def test_reboot_answers_before_rebooting(client: TestClient, monkeypatch: pytest
     assert response.status_code == HTTPStatus.OK
     assert response.json()["scheduled"] is True
     assert rebooted, "the reboot must be scheduled as a background task, after the response"
+
+
+# --------------------------------------------------------------------------------------
+# /chsh/sweep and /chsh/request-angle: the hardware and the network are faked.
+# --------------------------------------------------------------------------------------
+
+
+class FakeWaveplate:
+    def __init__(self) -> None:
+        self.moves: list[float] = []
+
+    def move_to(self, angle: float) -> None:
+        self.moves.append(angle)
+
+
+@pytest.fixture
+def waveplate(monkeypatch: pytest.MonkeyPatch) -> FakeWaveplate:
+    plate = FakeWaveplate()
+
+    class FakeRouterClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_device(self, *_: object) -> FakeWaveplate:
+            return plate
+
+    monkeypatch.setattr(chsh, "Client", FakeRouterClient)
+    return plate
+
+
+@pytest.fixture
+def outbound() -> Iterator[list[httpx.Request]]:
+    """Record the leader's calls to the follower and the timetagger, answering each one."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/timetagger/measure_correlation":
+            return httpx.Response(200, json=len(seen))
+        if request.url.path == "/system/settings":
+            return httpx.Response(200, json={"node_name": "bob", "follower_node_address": None})
+        return httpx.Response(200, json=True)
+
+    async def fake_http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            yield http_client
+
+    app.dependency_overrides[get_http_client] = fake_http_client
+    yield seen
+    app.dependency_overrides.pop(get_http_client, None)
+
+
+def test_request_angle_moves_the_requested_plate_to_half_the_angle(
+    client: TestClient, waveplate: FakeWaveplate
+) -> None:
+    response = client.post("/chsh/request-angle", params={"angle": 45.0})
+
+    assert response.status_code == HTTPStatus.OK
+    assert waveplate.moves == [22.5]
+
+
+def test_sweep_pins_the_follower_once_and_measures_every_step(
+    client: TestClient,
+    waveplate: FakeWaveplate,
+    outbound: list[httpx.Request],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "follower_node_address", "follower.invalid:8000")
+
+    response = client.post(
+        "/chsh/sweep",
+        params={"timetagger_address": "tt.invalid:9000", "follower_angle": 30.0, "step_deg": 90.0},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    body = response.json()
+    assert body["angles"] == [0.0, 90.0, 180.0, 270.0]
+    assert body["leader_name"] == settings.node_name
+    assert body["follower_name"] == "bob"
+    assert len(body["coincidences"]) == len(body["angles"])
+    assert waveplate.moves == [0.0, 45.0, 90.0, 135.0]
+    follower_calls = [r for r in outbound if r.url.host == "follower.invalid" and r.url.path != "/system/settings"]
+    assert len(follower_calls) == 1
+    assert follower_calls[0].url.path == "/chsh/request-angle"
+    assert follower_calls[0].url.params["angle"] == "30.0"
+
+
+def test_sweep_without_a_follower_is_a_503(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "follower_node_address", None)
+
+    response = client.post("/chsh/sweep", params={"timetagger_address": "tt.invalid:9000", "follower_angle": 0.0})
+
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_sweep_rejects_a_step_that_is_not_positive(client: TestClient) -> None:
+    response = client.post(
+        "/chsh/sweep", params={"timetagger_address": "tt.invalid:9000", "follower_angle": 0.0, "step_deg": 0}
+    )
+
+    assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+
+
+def test_a_follower_that_will_not_say_its_name_is_named_by_its_address(
+    client: TestClient, waveplate: FakeWaveplate, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/system/settings":
+            return httpx.Response(404)
+        return httpx.Response(200, json=7)
+
+    async def fake_http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            yield http_client
+
+    monkeypatch.setattr(settings, "follower_node_address", "follower.invalid:8000")
+    app.dependency_overrides[get_http_client] = fake_http_client
+    try:
+        response = client.post(
+            "/chsh/sweep",
+            params={"timetagger_address": "tt.invalid:9000", "follower_angle": 0.0, "step_deg": 180.0},
+        )
+    finally:
+        app.dependency_overrides.pop(get_http_client, None)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json()["follower_name"] == "follower.invalid:8000"
+    assert waveplate.moves == [0.0, 90.0]

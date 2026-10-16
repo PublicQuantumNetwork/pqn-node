@@ -72,6 +72,11 @@ class WhobotSettings(BaseSettings):
     # this rather than configured beside it, so no two keys can disagree about the same wait.
     per_game_timeout_s: float = Field(default=600.0, gt=0)
 
+    # How long an Angle Sweep may take on the Node. Its length depends on the step and the
+    # integration time the operator picks, which a bound fixed before the form is filled
+    # cannot see, so this is generous rather than derived.
+    sweep_timeout_s: float = Field(default=900.0, gt=0)
+
     # Bound for a single "are you there?" call, so listing Nodes cannot stall on a dead one.
     reachability_timeout_s: float = Field(default=5.0, gt=0)
 
