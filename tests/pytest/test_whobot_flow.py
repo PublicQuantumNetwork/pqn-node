@@ -937,6 +937,8 @@ SWEEP = {
     "leader_name": "alice",
     "follower_name": "bob",
     "follower_angle": 0.0,
+    "step_deg": 90.0,
+    "integration_time_s": 2.0,
     "angles": [0.0, 90.0, 180.0, 270.0],
     "coincidences": [100, 10, 100, 10],
 }

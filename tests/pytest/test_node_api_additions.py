@@ -15,8 +15,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from pqn_node.api import deps
 from pqn_node.api.deps import get_http_client
-from pqn_node.api.routes import chsh
 from pqn_node.api.routes import system
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import _last_probe
@@ -163,7 +163,7 @@ def waveplate(monkeypatch: pytest.MonkeyPatch) -> FakeWaveplate:
         def get_device(self, *_: object) -> FakeWaveplate:
             return plate
 
-    monkeypatch.setattr(chsh, "Client", FakeRouterClient)
+    monkeypatch.setattr(deps, "Client", FakeRouterClient)
     return plate
 
 
@@ -176,7 +176,7 @@ def outbound() -> Iterator[list[httpx.Request]]:
         seen.append(request)
         if request.url.path == "/timetagger/measure_correlation":
             return httpx.Response(200, json=len(seen))
-        if request.url.path == "/system/settings":
+        if request.url.path == "/node/config":
             return httpx.Response(200, json={"node_name": "bob", "follower_node_address": None})
         return httpx.Response(200, json=True)
 
@@ -198,6 +198,16 @@ def test_request_angle_moves_the_requested_plate_to_half_the_angle(
     assert waveplate.moves == [22.5]
 
 
+def test_request_angle_by_basis_moves_to_half_the_basis_angle_plus_90_when_perp(
+    client: TestClient, waveplate: FakeWaveplate
+) -> None:
+    for index, perp in [(0, False), (1, True)]:
+        response = client.post("/chsh/request-angle-by-basis", params={"index": index, "perp": perp})
+        assert response.status_code == HTTPStatus.OK
+
+    assert waveplate.moves == [22.5 / 2, (67.5 + 90) / 2]
+
+
 def test_sweep_pins_the_follower_once_and_measures_every_step(
     client: TestClient,
     waveplate: FakeWaveplate,
@@ -216,9 +226,11 @@ def test_sweep_pins_the_follower_once_and_measures_every_step(
     assert body["angles"] == [0.0, 90.0, 180.0, 270.0]
     assert body["leader_name"] == settings.node_name
     assert body["follower_name"] == "bob"
+    assert body["step_deg"] == 90.0  # noqa: PLR2004
+    assert body["integration_time_s"] == 1.0
     assert len(body["coincidences"]) == len(body["angles"])
     assert waveplate.moves == [0.0, 45.0, 90.0, 135.0]
-    follower_calls = [r for r in outbound if r.url.host == "follower.invalid" and r.url.path != "/system/settings"]
+    follower_calls = [r for r in outbound if r.url.host == "follower.invalid" and r.url.path != "/node/config"]
     assert len(follower_calls) == 1
     assert follower_calls[0].url.path == "/chsh/request-angle"
     assert follower_calls[0].url.params["angle"] == "30.0"
@@ -244,7 +256,7 @@ def test_a_follower_that_will_not_say_its_name_is_named_by_its_address(
     client: TestClient, waveplate: FakeWaveplate, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/system/settings":
+        if request.url.path == "/node/config":
             return httpx.Response(404)
         return httpx.Response(200, json=7)
 

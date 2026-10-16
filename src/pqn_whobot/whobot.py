@@ -93,12 +93,8 @@ from zoneinfo import ZoneInfo
 
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.constants import Polarization
 from pqn_node.core.config import GamesAvailability
-from pqn_node.core.sweep import Polarization
-from pqn_node.core.sweep import append_sweep_csv
-from pqn_node.core.sweep import describe_angle
-from pqn_node.core.sweep import plot_sweep
-from pqn_node.core.sweep import visibility
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
@@ -113,6 +109,7 @@ from pqn_whobot.actions import Status
 from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
+from pqn_whobot.config import DEFAULT_BASIS
 from pqn_whobot.config import ConfigWriteError
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.config import config_path
@@ -123,6 +120,9 @@ from pqn_whobot.registry import UNKNOWN_NAME
 from pqn_whobot.registry import Node
 from pqn_whobot.registry import resolve_nodes
 from pqn_whobot.schedule import Schedule
+from pqn_whobot.sweep_report import append_sweep_csv
+from pqn_whobot.sweep_report import describe_angle
+from pqn_whobot.sweep_report import plot_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +375,9 @@ class Whobot(ABC):
         scope=Scope.ONE,
         timeout_s=one_game_budget,
     )
-    async def run_chsh(self, node: Node, *, angle_a: float = 0.0, angle_b: float = 22.5) -> Report:
+    async def run_chsh(
+        self, node: Node, *, angle_a: float = DEFAULT_BASIS[0], angle_b: float = DEFAULT_BASIS[1]
+    ) -> Report:
         """Run one CHSH measurement and report what it measured.
 
         The angles are asked for because they are a choice: an operator running this by hand is
@@ -433,7 +435,7 @@ class Whobot(ABC):
         notes = []
         csv_path = sweep_csv_path()
         try:
-            append_sweep_csv(csv_path, result, integration_time_s, datetime.now(UTC))
+            append_sweep_csv(csv_path, result, datetime.now(UTC))
         except (OSError, ValueError) as e:
             logger.exception("%s: could not save the sweep to %s", node.name, csv_path)
             notes.append(f"The data was not saved to {csv_path}: {e}")
@@ -445,18 +447,19 @@ class Whobot(ABC):
             title=f"Angle Sweep — {result.leader_name} (leader) vs {result.follower_name} (follower)",
             summary=(
                 f"{result.leader_name} swept 0-360°, {result.follower_name} pinned at "
-                f"{describe_angle(follower_angle)}, {len(result.angles)} points of {integration_time_s:g}s"
+                f"{describe_angle(result.follower_angle)}, {len(result.angles)} points of "
+                f"{result.integration_time_s:g}s"
             ),
             sections=[
                 Section(
                     fields=[
-                        Field(name="Min coincidences", value=str(min(result.coincidences, default=0))),
-                        Field(name="Max coincidences", value=str(max(result.coincidences, default=0))),
-                        Field(name="Visibility", value=f"{visibility(result.coincidences):.4f}"),
+                        Field(name="Min coincidences", value=str(result.min_coincidences)),
+                        Field(name="Max coincidences", value=str(result.max_coincidences)),
+                        Field(name="Visibility", value=f"{result.visibility:.4f}"),
                     ]
                 )
             ],
-            image=plot_sweep(result, integration_time_s),
+            image=plot_sweep(result),
             notes=notes,
         )
 

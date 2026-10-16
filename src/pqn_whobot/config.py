@@ -24,6 +24,9 @@ from pydantic_settings import TomlConfigSettingsSource
 
 from pqn_node.core.config import write_config
 
+DEFAULT_BASIS: tuple[float, float] = (0.0, 22.5)
+"""The CHSH angles the digest measures at, and that "Run CHSH" falls back to when a field is cleared."""
+
 
 class ConfigWriteError(ValueError):
     """A write to ``whobot.toml`` was rolled back because the result would not load."""
@@ -66,7 +69,7 @@ class WhobotSettings(BaseSettings):
     # How the digest measures a Node. The address is resolved *on the Node*, so 127.0.0.1
     # means each Node's own host and one value serves the fleet; the port is the Node API's.
     timetagger_address: str = "127.0.0.1:9000"
-    basis: tuple[float, float] = (0.0, 22.5)
+    basis: tuple[float, float] = DEFAULT_BASIS
 
     # How long one Game may take. The digest's per-Node and whole-run bounds are derived from
     # this rather than configured beside it, so no two keys can disagree about the same wait.

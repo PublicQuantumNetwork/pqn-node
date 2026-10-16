@@ -2,18 +2,18 @@ import asyncio
 import logging
 import random
 import secrets
-from typing import TYPE_CHECKING
-from typing import cast
 
 import httpx
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import status
-from pqn_hardware.network.client import Client
 from pydantic import BaseModel
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
+from pqn_node.api.deps import get_rotator
+from pqn_node.api.peers import measure_coincidences
+from pqn_node.api.peers import require_follower_address
 from pqn_node.constants import BasisBool
 from pqn_node.constants import QKDEncodingBasis
 from pqn_node.core.config import NodeRole
@@ -21,9 +21,6 @@ from pqn_node.core.config import NodeState
 from pqn_node.core.config import protocol_cancelled_event
 from pqn_node.core.config import qkd_result_received_event
 from pqn_node.core.config import settings
-
-if TYPE_CHECKING:
-    from pqn_hardware.instrument import RotatorInstrument
 
 logger = logging.getLogger(__name__)
 
@@ -40,27 +37,13 @@ class QKDResult(BaseModel):
 async def _qkd(
     http_client: ClientDep,
     state: StateDep,
-    timetagger_address: str | None = None,
+    timetagger_address: str,
     follower_node_address: str | None = None,
 ) -> list[int]:
     if follower_node_address is None:
-        follower_node_address = settings.follower_node_address
-    if follower_node_address is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
-        )
+        follower_node_address = require_follower_address()
     logger.debug("Starting QKD")
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-    hwp = cast("RotatorInstrument", client.get_device(settings.qkd_settings.hwp[0], settings.qkd_settings.hwp[1]))
-
-    if hwp is None:
-        logger.error("Could not find half waveplate device")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
+    hwp = get_rotator(settings.qkd_settings.hwp)
 
     counts = []
     for basis in state.qkd_leader_basis_list:
@@ -77,20 +60,12 @@ async def _qkd(
         int_choice = secrets.randbits(1)  # FIXME: Make this real quantum random.
         logger.debug("Chosen integer choice: %s", int_choice)
         state.qkd_bit_list.append(int_choice)
-        hwp.move_to(basis.angles[int_choice].value)
-        logger.debug("Moving half waveplate to angle: %s", basis.angles[int_choice].value)
+        # QKD moves by waveplate angle straight from the enum, not by polarization angle.
+        hwp_angle = basis.angles[int_choice].value
+        hwp.move_to(hwp_angle)
+        logger.debug("Moving half waveplate to angle: %s", hwp_angle)
 
-        count_ret = await http_client.get(
-            f"http://{timetagger_address}/timetagger/measure_correlation?integration_time_s={settings.chsh_settings.measurement_config.integration_time_s}&coincidence_window_ps={settings.chsh_settings.measurement_config.binwidth_ps}&channel1={settings.chsh_settings.measurement_config.channel1}&channel2={settings.chsh_settings.measurement_config.channel2}&dark_count={settings.chsh_settings.measurement_config.dark_count}"
-        )
-        if count_ret.status_code != status.HTTP_200_OK:
-            logger.error("Failed to get correlation from timetagger: %s", count_ret.text)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to get correlation from timetagger",
-            )
-
-        c = cast("int", count_ret.json())
+        c = await measure_coincidences(http_client, timetagger_address, settings.chsh_settings.measurement_config)
         counts.append(c)
         logger.debug("Counted %d coincidences", c)
 
@@ -145,28 +120,16 @@ async def qkd(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="QKD basis list is empty",
         )
+    if not timetagger_address:
+        # Was a request to "http://None/..." that failed as a 500; say what is actually missing.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="timetagger_address is required")
 
     return await _qkd(http_client, state, timetagger_address)
 
 
 @router.post("/single_bit")
 async def request_qkd_single_pass(state: StateDep) -> bool:
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-    hwp = cast(
-        "RotatorInstrument",
-        client.get_device(settings.qkd_settings.request_hwp[0], settings.qkd_settings.request_hwp[1]),
-    )
-
-    if hwp is None:
-        logger.error("Could not find half waveplate device")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
-
-    logger.debug("Halfwaveplate device found: %s", hwp)
+    hwp = get_rotator(settings.qkd_settings.request_hwp)
 
     # Check if we have basis choices available
     if state.qkd_single_bit_current_index >= len(state.qkd_follower_basis_list):
@@ -184,9 +147,9 @@ async def request_qkd_single_pass(state: StateDep) -> bool:
 
     state.qkd_request_basis_list.append(basis_choice)
     state.qkd_request_bit_list.append(int_choice)
-    angle = basis_choice.angles[int_choice].value
+    hwp_angle = basis_choice.angles[int_choice].value
 
-    hwp.move_to(angle)
+    hwp.move_to(hwp_angle)
 
     return True
 

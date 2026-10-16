@@ -8,16 +8,27 @@ from pathlib import Path
 
 import pytest
 
+from pqn_node.constants import Polarization
 from pqn_node.constants import QKDAngleValuesHWP
-from pqn_node.core.sweep import POLARIZATION_TICKS
-from pqn_node.core.sweep import Polarization
 from pqn_node.core.sweep import SweepResult
-from pqn_node.core.sweep import append_sweep_csv
-from pqn_node.core.sweep import describe_angle
-from pqn_node.core.sweep import fit_fringe
-from pqn_node.core.sweep import plot_sweep
-from pqn_node.core.sweep import polarization_name
-from pqn_node.core.sweep import visibility
+from pqn_whobot.sweep_report import POLARIZATION_TICKS
+from pqn_whobot.sweep_report import append_sweep_csv
+from pqn_whobot.sweep_report import describe_angle
+from pqn_whobot.sweep_report import fit_fringe
+from pqn_whobot.sweep_report import plot_sweep
+from pqn_whobot.sweep_report import polarization_name
+
+
+def sweep_of(coincidences: list[int]) -> SweepResult:
+    return SweepResult(
+        leader_name="alice",
+        follower_name="bob",
+        follower_angle=45.0,
+        step_deg=90.0,
+        integration_time_s=1.0,
+        angles=[i * 90.0 for i in range(len(coincidences))],
+        coincidences=coincidences,
+    )
 
 
 def test_the_named_polarizations_are_the_nodes_own_waveplate_settings_doubled() -> None:
@@ -35,7 +46,7 @@ def test_only_the_nodes_four_settings_are_marked() -> None:
 
 @pytest.mark.parametrize(("angle", "name"), [(0.0, "H"), (45.0, "D"), (90.0, "V"), (315.0, "A"), (-45.0, "A")])
 def test_the_nodes_settings_are_named(angle: float, name: str) -> None:
-    assert polarization_name(angle) == name
+    assert polarization_name(angle) is Polarization(name)
 
 
 @pytest.mark.parametrize("angle", [30.0, 135.0, 225.0, 270.0])
@@ -49,40 +60,28 @@ def test_an_angle_is_described_with_its_name_only_when_it_has_one() -> None:
 
 
 def test_visibility_is_max_minus_min_over_max_plus_min() -> None:
-    assert visibility([100, 10, 100, 10]) == pytest.approx(90 / 110)
+    result = sweep_of([100, 10, 100, 10])
+
+    assert result.visibility == pytest.approx(90 / 110)
+    assert (result.min_coincidences, result.max_coincidences) == (10, 100)
 
 
 @pytest.mark.parametrize("counts", [[0, 0, 0], []])
 def test_visibility_with_nothing_counted_is_zero(counts: list[int]) -> None:
-    assert visibility(counts) == 0.0
+    assert sweep_of(counts).visibility == 0.0
 
 
 def test_the_plot_is_a_png() -> None:
-    pytest.importorskip("matplotlib")
-    result = SweepResult(
-        leader_name="alice",
-        follower_name="bob",
-        follower_angle=45.0,
-        angles=[0.0, 90.0, 180.0, 270.0],
-        coincidences=[100, 10, 100, 10],
-    )
-
-    assert plot_sweep(result, 1.0).startswith(b"\x89PNG\r\n\x1a\n")
+    assert plot_sweep(sweep_of([100, 10, 100, 10])).startswith(b"\x89PNG\r\n\x1a\n")
 
 
-SAMPLE = SweepResult(
-    leader_name="alice",
-    follower_name="bob",
-    follower_angle=45.0,
-    angles=[0.0, 90.0],
-    coincidences=[100, 10],
-)
+SAMPLE = sweep_of([100, 10]).model_copy(update={"integration_time_s": 2.0})
 
 
 def test_a_sweep_is_appended_one_row_per_point_under_one_header(tmp_path: Path) -> None:
     path = tmp_path / "sweeps.csv"
-    append_sweep_csv(path, SAMPLE, 2.0, datetime(2026, 10, 15, 12, 0, tzinfo=UTC))
-    append_sweep_csv(path, SAMPLE, 2.0, datetime(2026, 10, 15, 13, 0, tzinfo=UTC))
+    append_sweep_csv(path, SAMPLE, datetime(2026, 10, 15, 12, 0, tzinfo=UTC))
+    append_sweep_csv(path, SAMPLE, datetime(2026, 10, 15, 13, 0, tzinfo=UTC))
 
     rows = list(csv.DictReader(path.open(encoding="utf-8")))
     assert len(rows) == 2 * len(SAMPLE.angles), "a second sweep adds rows, not a second header"
@@ -99,7 +98,6 @@ def test_a_sweep_is_appended_one_row_per_point_under_one_header(tmp_path: Path) 
 
 
 def test_the_fit_recovers_a_clean_fringe() -> None:
-    pytest.importorskip("numpy")
     angles = [i * 10.0 for i in range(36)]
     counts = [round(500 + 400 * math.cos(math.radians(2 * (a - 45)))) for a in angles]
 

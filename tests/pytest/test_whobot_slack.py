@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from slack_sdk.errors import SlackApiError
 
-from pqn_node.core.sweep import Polarization
+from pqn_node.constants import Polarization
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
 from pqn_whobot.actions import Field

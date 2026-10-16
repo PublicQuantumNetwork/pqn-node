@@ -106,6 +106,11 @@ def _param_block(name: str) -> str:
     return f"whobot_param_{name}"
 
 
+def _param_label(parameter: Parameter) -> str:
+    """Turn a parameter's name into a form label: ``step_deg`` becomes "Step Deg"."""
+    return parameter.name.replace("_", " ").title()
+
+
 @dataclass(frozen=True)
 class SlackReply(ReplyHandle):
     """Where a reply goes, and how. The base class never opens one of these.
@@ -449,7 +454,7 @@ class WhobotSlack(Whobot):
         return {
             "type": "input",
             "block_id": _param_block(parameter.name),
-            "label": {"type": "plain_text", "text": parameter.name.replace("_", " ").title()},
+            "label": {"type": "plain_text", "text": _param_label(parameter)},
             "element": {
                 "type": "static_select",
                 "action_id": _param_block(parameter.name),
@@ -469,7 +474,7 @@ class WhobotSlack(Whobot):
             "type": "input",
             "block_id": _param_block(parameter.name),
             "optional": True,
-            "label": {"type": "plain_text", "text": parameter.name.replace("_", " ").title()},
+            "label": {"type": "plain_text", "text": _param_label(parameter)},
             "element": {
                 "type": "number_input",
                 "action_id": _param_block(parameter.name),

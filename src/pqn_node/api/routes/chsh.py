@@ -3,27 +3,25 @@ import json
 import logging
 import math
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING
 from typing import Annotated
-from typing import cast
 
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Query
 from fastapi import status
 from fastapi.responses import StreamingResponse
-from pqn_hardware.network.client import Client
 from pydantic import BaseModel
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
-from pqn_node.api.routes.system import fetch_node_name
+from pqn_node.api.deps import get_rotator
+from pqn_node.api.deps import move_to_polarization
+from pqn_node.api.peers import fetch_node_name
+from pqn_node.api.peers import measure_coincidences
+from pqn_node.api.peers import require_follower_address
 from pqn_node.core.config import chsh_progress_event
 from pqn_node.core.config import settings
 from pqn_node.core.sweep import SweepResult
-
-if TYPE_CHECKING:
-    from pqn_hardware.instrument import RotatorInstrument
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +84,7 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
     timetagger_address: str,
     state: StateDep,
 ) -> ChshResult:
-    follower_node_address = settings.follower_node_address
-    if follower_node_address is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
-        )
+    follower_node_address = require_follower_address()
     logger.debug("Starting CHSH")
 
     # Initialize progress tracking
@@ -99,21 +93,8 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
     state.chsh_progress_total = 16  # 2 basis x 2 follower x 2 angles x 2 perp
     chsh_progress_event.set()
 
-    logger.debug("Instantiating client")
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-
     # TODO: Check if settings.chsh_settings.hwp is set before even trying to get the device.
-    hwp = cast("RotatorInstrument", client.get_device(settings.chsh_settings.hwp[0], settings.chsh_settings.hwp[1]))
-    if hwp is None:
-        logger.error("Could not find half waveplate device")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
-
-    logger.debug("Halfwaveplate device found: %s", hwp)
+    hwp = get_rotator(settings.chsh_settings.hwp)
 
     expectation_values = []
     expectation_errors = []
@@ -122,7 +103,7 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
         for i in range(2):  # Going through follower basis angles
             counts = []
             for a in [angle, (angle + 90)]:
-                hwp.move_to(a / 2)
+                move_to_polarization(hwp, a)
                 for perp in [False, True]:
                     r = await http_client.post(
                         f"http://{follower_node_address}/chsh/request-angle-by-basis?index={i}&perp={perp}"
@@ -135,17 +116,11 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
                             detail="Failed to request follower",
                         )
 
-                    count_ret = await http_client.get(
-                        f"http://{timetagger_address}/timetagger/measure_correlation?integration_time_s={settings.chsh_settings.measurement_config.integration_time_s}&coincidence_window_ps={settings.chsh_settings.measurement_config.binwidth_ps}&channel1={settings.chsh_settings.measurement_config.channel1}&channel2={settings.chsh_settings.measurement_config.channel2}&dark_count={settings.chsh_settings.measurement_config.dark_count}"
-                    )
-                    if count_ret.status_code != status.HTTP_200_OK:
-                        logger.error("Failed to get correlation from timetagger: %s", count_ret.text)
-                        raise HTTPException(
-                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail="Failed to get correlation from timetagger",
+                    counts.append(
+                        await measure_coincidences(
+                            http_client, timetagger_address, settings.chsh_settings.measurement_config
                         )
-                    count = cast("int", count_ret.json())
-                    counts.append(count)
+                    )
 
                     # Update progress
                     state.chsh_progress_current += 1
@@ -205,46 +180,22 @@ async def chsh(
     return await _chsh(basis, http_client, timetagger_address, state)
 
 
-@router.post("/request-angle-by-basis")
-async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = False) -> bool:
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-    hwp = cast(
-        "RotatorInstrument",
-        client.get_device(settings.chsh_settings.request_hwp[0], settings.chsh_settings.request_hwp[1]),
-    )
-    if hwp is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
-
-    angle = state.chsh_request_basis[index] + 90 * perp
-    hwp.move_to(angle / 2)
+def _move_request_hwp(angle: float) -> bool:
+    """Move this Node's requested waveplate, the one a leader steers, to a polarization angle."""
+    move_to_polarization(get_rotator(settings.chsh_settings.request_hwp), angle)
     logger.info("moving waveplate", extra={"angle": angle})
     return True
+
+
+@router.post("/request-angle-by-basis")
+async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = False) -> bool:
+    return _move_request_hwp(state.chsh_request_basis[index] + 90 * perp)
 
 
 @router.post("/request-angle")
 async def request_angle(angle: float) -> bool:
     """Move the requested waveplate to a free polarization angle, rather than one of the basis angles."""
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-    hwp = cast(
-        "RotatorInstrument",
-        client.get_device(settings.chsh_settings.request_hwp[0], settings.chsh_settings.request_hwp[1]),
-    )
-    if hwp is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
-
-    hwp.move_to(angle / 2)
-    logger.info("moving waveplate", extra={"angle": angle})
-    return True
+    return _move_request_hwp(angle)
 
 
 @router.post("/sweep")
@@ -259,22 +210,8 @@ async def sweep(
 
     Returns the coincidence count at every step, for plotting a fringe.
     """
-    follower_node_address = settings.follower_node_address
-    if follower_node_address is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
-        )
-
-    client = Client(
-        host=settings.router_address, port=settings.router_port, router_name=settings.router_name, timeout=600_000
-    )
-    hwp = cast("RotatorInstrument", client.get_device(settings.chsh_settings.hwp[0], settings.chsh_settings.hwp[1]))
-    if hwp is None:
-        logger.error("Could not find half waveplate device")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Could not find half waveplate device",
-        )
+    follower_node_address = require_follower_address()
+    hwp = get_rotator(settings.chsh_settings.hwp)
 
     r = await http_client.post(f"http://{follower_node_address}/chsh/request-angle", params={"angle": follower_angle})
     if r.status_code != status.HTTP_200_OK:
@@ -286,33 +223,23 @@ async def sweep(
 
     follower_name = await fetch_node_name(http_client, follower_node_address)
 
-    measurement = settings.chsh_settings.measurement_config
     angles = [i * step_deg for i in range(math.ceil(360 / step_deg))]
     coincidences = []
     for angle in angles:
-        hwp.move_to(angle / 2)
-        count_ret = await http_client.get(
-            f"http://{timetagger_address}/timetagger/measure_correlation",
-            params={
-                "integration_time_s": integration_time_s,
-                "coincidence_window_ps": measurement.binwidth_ps,
-                "channel1": measurement.channel1,
-                "channel2": measurement.channel2,
-            },
-        )
-        if count_ret.status_code != status.HTTP_200_OK:
-            logger.error("Failed to get correlation from timetagger: %s", count_ret.text)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to get correlation from timetagger",
+        move_to_polarization(hwp, angle)
+        coincidences.append(
+            await measure_coincidences(
+                http_client, timetagger_address, settings.chsh_settings.measurement_config, integration_time_s
             )
-        coincidences.append(cast("int", count_ret.json()))
+        )
         logger.info("Sweep angle %s: %s coincidences", angle, coincidences[-1])
 
     return SweepResult(
         leader_name=settings.node_name,
         follower_name=follower_name,
         follower_angle=follower_angle,
+        step_deg=step_deg,
+        integration_time_s=integration_time_s,
         angles=angles,
         coincidences=coincidences,
     )

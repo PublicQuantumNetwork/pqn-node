@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
+from pqn_node.api.peers import require_follower_address
 from pqn_node.core.config import NodeRole
 from pqn_node.core.config import ask_user_for_follow_event
 from pqn_node.core.config import protocol_cancelled_event
@@ -121,11 +122,7 @@ async def collect_follower(request: Request, state: StateDep, http_client: Clien
     -------
         CollectFollowerResponse indicating if the follower accepted the request.
     """
-    address = settings.follower_node_address
-    if address is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="follower_node_address not configured"
-        )
+    address = require_follower_address()
     logger.info("Requesting client at %s to follow", address)
 
     # Get the port this server is listening on
