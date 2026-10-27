@@ -266,7 +266,10 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
             if request.url.path == "/timetagger/measure_correlation":
                 integration_time_s = float(request.url.params["integration_time_s"])
                 integration_times.append(integration_time_s)
-                counts = round(follower.source(plate.moves[-1], follower.moves[-1]) * integration_time_s)
+                # The leader's photons pass the waveplate its qkd_settings.hwp names: a test
+                # that names the rotators apart registers that plate, others share one.
+                leader_plate = plates.get(settings.qkd_settings.hwp, plate)
+                counts = round(follower.source(leader_plate.moves[-1], follower.moves[-1]) * integration_time_s)
                 return httpx.Response(200, json=counts)
             response = follower.respond(request)
             if response is None:
@@ -331,23 +334,32 @@ def test_the_correlation_leader_moves_by_its_own_answers(
 ) -> None:
     """The leader's Answers alone move its own waveplate, left → V and right → D, whatever the follower answered.
 
-    The follower answers left twice, so a right answer lands on a medium VD level and shows
-    up as a disagreement while the leader's moves stay exactly its own Answers'. The leader
-    also starts with bits left over from an earlier entanglement game and no reset between
-    games, which its correlation moves must ignore.
+    Its waveplate is the one named in qkd_settings.hwp, not the follower's request_hwp: with
+    the two rotators named apart, only the hwp one moves. The follower answers left twice,
+    so a right answer lands on a medium VD level and shows up as a disagreement while the
+    leader's moves stay exactly its own Answers'. The leader also starts with bits left over
+    from an earlier entanglement game and no reset between games, which its correlation
+    moves must ignore.
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.qkd_settings, "hwp", ("provider", "leader"))
+    monkeypatch.setattr(settings.qkd_settings, "request_hwp", ("provider", "request"))
     game_state.qkd_leader_basis_list = [ANSWER_TO_BASIS[answer] for answer in case.answers]
     # Bits an earlier entanglement game recorded, left in place by a missing reset.
     game_state.qkd_bit_list = [0, 1]
     game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT, LEFT]))
+    leader_plate = FakeWaveplate()
+    request_plate = FakeWaveplate()
+    game.plates[("provider", "leader")] = leader_plate
+    game.plates[("provider", "request")] = request_plate
 
     response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
 
     assert response.status_code == HTTPStatus.OK
     assert response.json() == case.agreement
-    assert game.plate.moves == [CALIBRATED[name] for name in case.angles]
+    assert leader_plate.moves == [CALIBRATED[name] for name in case.angles]
+    assert request_plate.moves == []
     # A correlation game neither consumes nor records random bits.
     assert game_state.qkd_bit_list == [0, 1]
     assert_answers_never_fetched(game.follower)
@@ -526,6 +538,8 @@ def test_an_entanglement_game_end_to_end(
     monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
     monkeypatch.setattr(qkd, "secrets", FixedBits([0, 1, 0, 1]))
     monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 4)
+    monkeypatch.setattr(settings.qkd_settings, "hwp", ("provider", "leader"))
+    monkeypatch.setattr(settings.qkd_settings, "request_hwp", ("provider", "request"))
     game_state.role = NodeRole.LEADER
     game_state.followers_address = "follower.invalid:8000"
     follower = FakeFollower(
@@ -535,14 +549,20 @@ def test_an_entanglement_game_end_to_end(
         source=entangled_rate,
     )
     game = make_game(follower)
+    leader_plate = FakeWaveplate()
+    request_plate = FakeWaveplate()
+    game.plates[("provider", "leader")] = leader_plate
+    game.plates[("provider", "request")] = request_plate
     assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
 
     response = start_ssm_game(game, [LEFT, RIGHT, LEFT, RIGHT])
 
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {"n_matching_bits": 2, "n_total_bits": 4, "emoji": "🙈", "role": "leader"}
-    # The random bit still picks the state within each Answer's basis, on both sides.
-    assert game.plate.moves == [CALIBRATED[name] for name in ["h", "a", "h", "a"]]
+    # The random bit still picks the state within each Answer's basis, on both sides, and
+    # the leader moves only its own hwp rotator.
+    assert leader_plate.moves == [CALIBRATED[name] for name in ["h", "a", "h", "a"]]
+    assert request_plate.moves == []
     assert follower.moves == [CALIBRATED[name] for name in ["v", "d", "a", "h"]]
     # The leader recorded exactly the random bits it moved by, one per question, and its
     # Answers stayed put, as they do today.
@@ -576,6 +596,39 @@ def test_an_entanglement_game_where_no_answer_matches(
 
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {"n_matching_bits": 0, "n_total_bits": 2, "emoji": "🙈", "role": "leader"}
+    assert follower.results == [response.json()]
+    assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
+
+
+def test_a_one_question_entanglement_game(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-question entanglement game stays today's game: the key bits, not the agreement (decision 4).
+
+    The two Answers match, so today's count is 1 whatever the photons did; the scripted
+    count lands on a medium Coincidence level (1500 cps), which a correlation-style
+    agreement would count as 0. Today's game still fetches the follower's Answers.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([1]))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 1)
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(
+        mode=OperationMode.ENTANGLEMENT,
+        answers=[LEFT],
+        bits=[1],
+        source=RateSequence([1500.0]),
+    )
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, [LEFT])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"n_matching_bits": 1, "n_total_bits": 1, "emoji": "🙈", "role": "leader"}
     assert follower.results == [response.json()]
     assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
 
@@ -726,17 +779,125 @@ def test_a_fractional_integration_time_divides_the_count_exactly(
 
     The configured 0.25 s is below 1 s and not a multiple of 0.1 s, so a time rounded to
     tenths (0.2 s) or floored at a second (1 s) shows in what the time tagger was asked
-    for. A source giving 1000 cps over the 0.25 s counts 250, whose rate is 1000 cps
-    (low → agreed).
+    for. A source giving 2000 cps over the 0.25 s counts 500, whose rate is 2000 cps
+    (medium → disagreed); classifying the raw count instead would give 500 cps, the low
+    level (agreed).
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
     monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=0.25))
     game_state.qkd_leader_basis_list = [QKDEncodingBasis.HV]
-    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT], source=RateSequence([1000.0])))
+    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT], source=RateSequence([2000.0])))
 
     response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
 
     assert response.status_code == HTTPStatus.OK
     assert game.integration_times == [0.25]
-    assert response.json() == [1]
+    assert response.json() == [0]
+
+
+class CorrelationGameCase(NamedTuple):
+    """One table-driven correlation game: its Reference rates, integration time and counts.
+
+    The counts are the time tagger's, one per question, scripted through the source; every
+    case but the last has equal first and last counts with a different level between them.
+    """
+
+    name: str
+    references: dict[str, float]
+    integration_time_s: float
+    counts: list[int]
+
+
+CORRELATION_GAME_CASES = [
+    CorrelationGameCase(
+        "default references, sub-second integration", {"vv": 3000.0, "vd": 1500.0, "dd": 750.0}, 0.25, [500, 750, 500]
+    ),
+    CorrelationGameCase(
+        "default references, a rate above VD nearest VD",
+        {"vv": 3000.0, "vd": 1500.0, "dd": 750.0},
+        2.5,
+        [4500, 7500, 4500],
+    ),
+    CorrelationGameCase("VV not twice VD", {"vv": 2800.0, "vd": 1500.0, "dd": 750.0}, 1.0, [2200, 1200, 2200]),
+    CorrelationGameCase("DD above half of VD", {"vv": 3000.0, "vd": 1500.0, "dd": 900.0}, 2.5, [2875, 3750, 2875]),
+    CorrelationGameCase("DD at zero", {"vv": 3000.0, "vd": 1500.0, "dd": 0.0}, 1.0, [0, 1500, 0]),
+    CorrelationGameCase(
+        "fractional references, minute-long integration",
+        {"vv": 3000.6, "vd": 1503.4, "dd": 750.2},
+        60.0,
+        [135111, 90204, 67557],
+    ),
+]
+
+
+def expected_agreement(case: CorrelationGameCase) -> list[int]:
+    """Compute a case's expected agreement independently of the Node's own classification.
+
+    Each count becomes a rate with the case's integration time, the nearest of the three
+    Reference rates wins, and medium is the only disagreement.
+    """
+    agreement = []
+    for count in case.counts:
+        rate = count / case.integration_time_s
+        nearest = min(
+            (
+                (case.references["vv"], "high"),
+                (case.references["vd"], "medium"),
+                (case.references["dd"], "low"),
+            ),
+            key=lambda reference: abs(reference[0] - rate),
+        )
+        agreement.append(int(nearest[1] != "medium"))
+    return agreement
+
+
+@pytest.mark.parametrize("case", CORRELATION_GAME_CASES, ids=[case.name for case in CORRELATION_GAME_CASES])
+def test_a_correlation_game_classifies_each_count_by_its_nearest_reference(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+    case: CorrelationGameCase,
+) -> None:
+    """A whole-game table: Reference-rate sets, integration times and per-question counts.
+
+    Each case runs the raw protocol for its per-question agreement and then the whole game
+    for the n_matching_bits that agreement sums to, with the time tagger scripting the
+    case's counts at the case's integration time.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    for name, rate in case.references.items():
+        monkeypatch.setattr(settings.correlation_settings.reference_rates, name, rate)
+    monkeypatch.setattr(
+        settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=case.integration_time_s)
+    )
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", len(case.counts))
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    # A rate per count, so the time tagger returns exactly the case's counts; enough for
+    # both the raw protocol and the whole game.
+    follower = FakeFollower(
+        mode=OperationMode.CORRELATION,
+        answers=[LEFT] * (2 * len(case.counts)),
+        source=RateSequence([count / case.integration_time_s for count in case.counts] * 2),
+    )
+    game = make_game(follower)
+    game_state.qkd_leader_basis_list = [QKDEncodingBasis.HV] * len(case.counts)
+    protocol = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
+    assert protocol.status_code == HTTPStatus.OK
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    result = start_ssm_game(game, [LEFT] * len(case.counts))
+
+    assert result.status_code == HTTPStatus.OK
+    assert protocol.json() == expected_agreement(case)
+    assert result.json() == {
+        "n_matching_bits": sum(expected_agreement(case)),
+        "n_total_bits": len(case.counts),
+        "emoji": "🙈",
+        "role": "leader",
+    }
+    # Every question of both runs was measured for the case's integration time.
+    assert game.integration_times == [case.integration_time_s] * (2 * len(case.counts))
+    assert_answers_never_fetched(follower)
