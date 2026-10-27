@@ -39,9 +39,9 @@ from pqn_node.core.config import get_state
 from pqn_node.core.config import settings
 from pqn_node.main import app
 
-# Calibrated angles a little off today's raw ones, so a raw move can never pass for a
-# calibrated one; the same values as the Phase 1 move tests.
-CALIBRATED = {"h": 3.0, "v": 44.0, "d": 20.0, "a": -20.0}
+# Calibrated angles a little off today's raw ones, and fractional, so neither a raw move
+# nor a rounded one can ever pass for a calibrated one.
+CALIBRATED = {"h": 2.7, "v": 44.6, "d": 22.3, "a": -19.8}
 
 # An Answer as the GUI sends it: 'a' is left, 'b' is right; left → V (HV), right → D (DA).
 LEFT = "a"
