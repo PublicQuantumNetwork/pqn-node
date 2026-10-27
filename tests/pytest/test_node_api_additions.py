@@ -104,6 +104,14 @@ def _plain_config(path: Path) -> dict[str, object]:
     return dict(tomlkit.parse(path.read_text(encoding="utf-8")).unwrap())
 
 
+def _calibration_without(value: str) -> dict[str, object]:
+    """Build a full calibration body with one named value omitted: the body a PUT must refuse."""
+    return {
+        section: {name: number for name, number in numbers.items() if name != value}
+        for section, numbers in NEW_CALIBRATION.items()
+    }
+
+
 def test_node_config_reports_the_node_name(client: TestClient) -> None:
     """Whobot reads each Node's name from the Node itself, not from its own registry."""
     response = client.get("/node/config")
@@ -240,20 +248,28 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
 @pytest.mark.parametrize(
     "request_kwargs",
     [
+        # Each angle and each rate omitted in turn: whichever value a body leaves out, the PUT is refused.
+        *(
+            pytest.param({"json": _calibration_without(value)}, id=f"{value} missing")
+            for value in (*NEW_CALIBRATION["polarization_angles"], *NEW_CALIBRATION["reference_rates"])
+        ),
+        pytest.param(
+            {"json": {"polarization_angles": NEW_CALIBRATION["polarization_angles"]}},
+            id="reference_rates missing",
+        ),
+        pytest.param(
+            {"json": {"reference_rates": NEW_CALIBRATION["reference_rates"]}},
+            id="polarization_angles missing",
+        ),
         pytest.param(
             {
                 "json": {
-                    "polarization_angles": {"h": 1.5, "v": 2.5, "d": 3.5},  # a is missing
-                    "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
+                    # The rate keys under the angles section: the wrong shape a tired operator pastes.
+                    "polarization_angles": NEW_CALIBRATION["reference_rates"],
+                    "reference_rates": NEW_CALIBRATION["reference_rates"],
                 }
             },
-            id="an angle missing",
-        ),
-        pytest.param(
-            {"json": {"polarization_angles": NEW_CALIBRATION["polarization_angles"]}}, id="reference_rates missing"
-        ),
-        pytest.param(
-            {"json": {"reference_rates": NEW_CALIBRATION["reference_rates"]}}, id="polarization_angles missing"
+            id="rate keys under polarization_angles",
         ),
         pytest.param({"json": {}}, id="an empty body"),
         pytest.param({}, id="no body at all"),
@@ -268,10 +284,10 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
         ),
     ],
 )
-def test_put_calibration_refuses_an_incomplete_body(
+def test_put_calibration_refuses_a_body_that_does_not_state_every_value(
     client: TestClient, commented_config: Path, request_kwargs: dict[str, object]
 ) -> None:
-    """Agent decision A4: a PUT states the whole calibration; anything less is a 422 that writes nothing."""
+    """Agent decision A4: a PUT states every angle and every rate; anything less, or off-shape, writes nothing."""
     before = commented_config.read_text(encoding="utf-8")
     before_angles = settings.polarization_angles.model_copy()
     before_rates = settings.correlation_settings.reference_rates.model_copy()
@@ -307,11 +323,27 @@ def test_put_calibration_round_trips_realistic_values(client: TestClient, commen
     assert settings.correlation_settings.reference_rates == ReferenceRates(**REALISTIC_CALIBRATION["reference_rates"])
     written = commented_config.read_text(encoding="utf-8")
     assert "qf = true  # Quantum Fortune" in written  # the operator's comments survive the write
-    assert _plain_config(commented_config) == {
+    realistic_config = {
         **BASE_CONFIG,
         "operation_mode": "correlation",
         "polarization_angles": REALISTIC_CALIBRATION["polarization_angles"],
         "correlation_settings": {"reference_rates": REALISTIC_CALIBRATION["reference_rates"]},
+    }
+    assert _plain_config(commented_config) == realistic_config
+
+    # A zero rate is a value like any other — an operator zeroing a reference while debugging —
+    # not "no value", so it must be written and read back like every other number.
+    zero_rate = {**REALISTIC_CALIBRATION, "reference_rates": {**REALISTIC_CALIBRATION["reference_rates"], "vv": 0.0}}
+
+    response = client.put("/node/calibration", json=zero_rate)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == zero_rate
+    assert client.get("/node/calibration").json() == zero_rate
+    assert settings.correlation_settings.reference_rates.vv == 0.0
+    assert _plain_config(commented_config) == {
+        **realistic_config,
+        "correlation_settings": {"reference_rates": zero_rate["reference_rates"]},
     }
 
 
