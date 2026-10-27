@@ -73,6 +73,21 @@ def entangled_rate(leader_angle: float, follower_angle: float) -> float:
     return VV_RATE * math.cos(difference) ** 2
 
 
+def no_coincidences_rate(_leader_angle: float, _follower_angle: float) -> float:
+    """Return the coincidences/s of a source that gives none: every count is zero."""
+    return 0.0
+
+
+class RateSequence:
+    """A source that gives the coincidences/s the test chose, one per question, in order."""
+
+    def __init__(self, rates: list[float]) -> None:
+        self._rates = list(rates)
+
+    def __call__(self, _leader_angle: float, _follower_angle: float) -> float:
+        return self._rates.pop(0)
+
+
 def _no_random_bit(_n_bits: int) -> int:
     """Stand-in for secrets.randbits: correlation mode has no random bit, so being asked is a failure."""
     message = "correlation mode has no random bit"
@@ -85,7 +100,9 @@ class FixedBits:
     def __init__(self, bits: list[int]) -> None:
         self._bits = list(bits)
 
-    def randbits(self, _n_bits: int) -> int:
+    def randbits(self, n_bits: int) -> int:
+        message = "the random bit of a question is one bit"
+        assert n_bits == 1, message
         return self._bits.pop(0)
 
 
@@ -152,12 +169,19 @@ class FakeFollower:
 
 
 class FakePair:
-    """A leading Node with a fake waveplate, playing against the fake follower and time tagger."""
+    """A leading Node with a fake waveplate, playing against the fake follower and time tagger.
 
-    def __init__(self, client: TestClient, plate: FakeWaveplate, follower: FakeFollower) -> None:
+    ``integration_times`` records what the time tagger was asked to integrate for, one entry
+    per measurement.
+    """
+
+    def __init__(
+        self, client: TestClient, plate: FakeWaveplate, follower: FakeFollower, integration_times: list[float]
+    ) -> None:
         self.client = client
         self.plate = plate
         self.follower = follower
+        self.integration_times = integration_times
 
 
 @pytest.fixture(autouse=True)
@@ -215,6 +239,7 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
 
     def make(follower: FakeFollower) -> FakePair:
         plate = FakeWaveplate()
+        integration_times: list[float] = []
 
         class FakeRouterClient:
             def __init__(self, **_: object) -> None:
@@ -230,6 +255,7 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
             follower.requests.append(request)
             if request.url.path == "/timetagger/measure_correlation":
                 integration_time_s = float(request.url.params["integration_time_s"])
+                integration_times.append(integration_time_s)
                 counts = round(follower.source(plate.moves[-1], follower.moves[-1]) * integration_time_s)
                 return httpx.Response(200, json=counts)
             response = follower.respond(request)
@@ -243,7 +269,7 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
 
         app.dependency_overrides[get_http_client] = fake_http_client
         # No `with` block on the TestClient: the lifespan startup health check probes real hardware.
-        return FakePair(TestClient(app), plate, follower)
+        return FakePair(TestClient(app), plate, follower, integration_times)
 
     yield make
     app.dependency_overrides.pop(get_http_client, None)
@@ -293,10 +319,18 @@ def test_the_correlation_leader_moves_by_its_own_answers(
     monkeypatch: pytest.MonkeyPatch,
     case: LeaderMoveCase,
 ) -> None:
-    """The leader's Answers alone move its own waveplate, left → V and right → D, whatever the follower answered."""
+    """The leader's Answers alone move its own waveplate, left → V and right → D, whatever the follower answered.
+
+    The follower answers left twice, so a right answer lands on a medium VD level and shows
+    up as a disagreement while the leader's moves stay exactly its own Answers'. The leader
+    also starts with bits left over from an earlier entanglement game and no reset between
+    games, which its correlation moves must ignore.
+    """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
     game_state.qkd_leader_basis_list = [ANSWER_TO_BASIS[answer] for answer in case.answers]
+    # Bits an earlier entanglement game recorded, left in place by a missing reset.
+    game_state.qkd_bit_list = [0, 1]
     game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT, LEFT]))
 
     response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
@@ -304,6 +338,8 @@ def test_the_correlation_leader_moves_by_its_own_answers(
     assert response.status_code == HTTPStatus.OK
     assert response.json() == case.agreement
     assert game.plate.moves == [CALIBRATED[name] for name in case.angles]
+    # A correlation game neither consumes nor records random bits.
+    assert game_state.qkd_bit_list == [0, 1]
     assert_answers_never_fetched(game.follower)
 
 
@@ -312,7 +348,11 @@ def test_the_correlation_follower_moves_by_its_own_answers(
     game_state: NodeState,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The follower's Answers alone move its own waveplate, left → V and right → D, one move per handshake."""
+    """The follower's Answers alone move its own waveplate, left → V and right → D, one move per handshake.
+
+    Decision 3: the leader never fetches the follower's Answers in correlation mode, so the
+    follower records none of them for it.
+    """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
     game_state.qkd_follower_basis_list = [QKDEncodingBasis.DA, QKDEncodingBasis.HV]
@@ -323,6 +363,8 @@ def test_the_correlation_follower_moves_by_its_own_answers(
     assert [response.status_code for response in responses] == [HTTPStatus.OK, HTTPStatus.OK]
     assert [response.json() for response in responses] == [True, True]
     assert game.plate.moves == [CALIBRATED["d"], CALIBRATED["v"]]
+    assert game_state.qkd_request_basis_list == []
+    assert game_state.qkd_request_bit_list == []
 
 
 # --------------------------------------------------------------------------------------
@@ -337,12 +379,19 @@ CLASSIFICATIONS = [
     # Between two Reference rates: whichever is nearer.
     (2500.0, CoincidenceLevel.HIGH),
     (2000.0, CoincidenceLevel.MEDIUM),
+    (1300.0, CoincidenceLevel.MEDIUM),
     (1200.0, CoincidenceLevel.MEDIUM),
+    (1000.0, CoincidenceLevel.LOW),
     (500.0, CoincidenceLevel.LOW),
     # Beyond the outer Reference rates.
     (6000.0, CoincidenceLevel.HIGH),
     (300.0, CoincidenceLevel.LOW),
     (0.0, CoincidenceLevel.LOW),
+    # Just either side of both midpoints (2250 and 1125): the exact value decides.
+    (2250.5, CoincidenceLevel.HIGH),
+    (2249.5, CoincidenceLevel.MEDIUM),
+    (1125.5, CoincidenceLevel.MEDIUM),
+    (1124.5, CoincidenceLevel.LOW),
     # Exactly midway, where the nearest is tied: the higher of the two tied references wins.
     (2250.0, CoincidenceLevel.HIGH),
     (1125.0, CoincidenceLevel.MEDIUM),
@@ -391,8 +440,10 @@ def test_a_correlation_game_end_to_end(
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
     monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 4)
-    # A non-default integration time, so a rate divided by any other time misclassifies.
+    # A non-default integration time, so a rate divided by any other time misclassifies, and a
+    # different one in the QKD settings, so measuring with the wrong config shows.
     monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2))
+    monkeypatch.setattr(settings.qkd_settings, "measurement_config", MeasurementConfig(integration_time_s=3))
     game_state.role = NodeRole.LEADER
     game_state.followers_address = "follower.invalid:8000"
     follower = FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT, RIGHT, LEFT, RIGHT])
@@ -406,6 +457,11 @@ def test_a_correlation_game_end_to_end(
     # Each side's own Answers moved only its own waveplate: left → V, right → D.
     assert game.plate.moves == [CALIBRATED[name] for name in ["v", "v", "d", "d"]]
     assert follower.moves == [CALIBRATED[name] for name in ["v", "d", "v", "d"]]
+    # Every question was measured for the CHSH config's 2 s, not the QKD settings' 3 s or any
+    # other time, and each count became a rate with that same time.
+    assert game.integration_times == [2.0, 2.0, 2.0, 2.0]
+    # A correlation game records no random bits of its own.
+    assert game_state.qkd_bit_list == []
     # The follower got the same result, one handshake per question, and its Answers were never fetched.
     assert follower.results == [response.json()]
     assert_answers_never_fetched(follower)
@@ -446,6 +502,145 @@ def test_an_entanglement_game_end_to_end(
     # The random bit still picks the state within each Answer's basis, on both sides.
     assert game.plate.moves == [CALIBRATED[name] for name in ["h", "a", "h", "a"]]
     assert follower.moves == [CALIBRATED[name] for name in ["v", "d", "a", "h"]]
+    # The leader recorded exactly the random bits it moved by, one per question.
+    assert game_state.qkd_bit_list == [0, 1, 0, 1]
     assert follower.results == [response.json()]
     # Today's game still fetches the follower's Answers.
     assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
+
+
+def test_a_one_question_correlation_game_that_disagrees(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single question is a whole game: its VD level disagrees, n_matching_bits is 0, and nothing is fetched.
+
+    One question on either side of the matching count keeps the game from silently falling
+    back to counting questions instead of agreements.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 1)
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(mode=OperationMode.CORRELATION, answers=[RIGHT])
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, [LEFT])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"n_matching_bits": 0, "n_total_bits": 1, "emoji": "🙈", "role": "leader"}
+    assert game.plate.moves == [CALIBRATED["v"]]
+    assert follower.moves == [CALIBRATED["d"]]
+    assert_answers_never_fetched(follower)
+
+
+def test_a_correlation_game_where_nothing_coincides(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source that gives no coincidences still plays: every zero count is a low level, so every question agrees.
+
+    The two sides' Answers disagree on every question, so with a bright source this game
+    would disagree everywhere; the zero counts alone make it agree, and the game still
+    never fetches the follower's Answers.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 3)
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(
+        mode=OperationMode.CORRELATION,
+        answers=[RIGHT, LEFT, RIGHT],
+        source=no_coincidences_rate,
+    )
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, [LEFT, RIGHT, LEFT])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"n_matching_bits": 3, "n_total_bits": 3, "emoji": "🙈", "role": "leader"}
+    assert_answers_never_fetched(follower)
+
+
+class AgreementCase(NamedTuple):
+    """One whole-game agreement case: both sides' Answers and the matching count they give."""
+
+    leader_answers: list[str]
+    follower_answers: list[str]
+    n_matching_bits: int
+
+
+AGREEMENT_CASES = [
+    # Every question VD or DV: a medium level, so every question disagrees.
+    AgreementCase([LEFT, LEFT, RIGHT, RIGHT], [RIGHT, RIGHT, LEFT, LEFT], 0),
+    # VV, VV, DD, DD: high, high, low, low, so every question agrees.
+    AgreementCase([LEFT, LEFT, RIGHT, RIGHT], [LEFT, LEFT, RIGHT, RIGHT], 4),
+]
+
+
+@pytest.mark.parametrize("case", AGREEMENT_CASES, ids=["every question disagrees", "every question agrees"])
+def test_a_correlation_game_whose_questions_all_agree_or_all_disagree(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+    case: AgreementCase,
+) -> None:
+    """A game where every Coincidence level says the same thing reports 0 or every question, not a stand-in.
+
+    Zero matches and all-questions-matching are the two counts a length or modulo could
+    silently stand in for.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", len(case.leader_answers))
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(mode=OperationMode.CORRELATION, answers=case.follower_answers)
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, case.leader_answers)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {
+        "n_matching_bits": case.n_matching_bits,
+        "n_total_bits": len(case.leader_answers),
+        "emoji": "🙈",
+        "role": "leader",
+    }
+    assert_answers_never_fetched(follower)
+
+
+def test_the_rate_keeps_its_full_precision_through_the_game(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate within 0.1 cps of a Reference midpoint classifies on its exact value, not a rounded one.
+
+    With the DD Reference at 749.6 cps the VD/DD midpoint sits at 1124.8 cps. Two questions
+    land at 1124.75 cps (just below: low, agreed) and 1124.875 cps (just above: medium,
+    disagreed), so flooring the rate, rounding it, being off by one count, or flooring the
+    distances all flip one of them.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.correlation_settings.reference_rates, "dd", 749.6)
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=8))
+    game_state.qkd_leader_basis_list = [QKDEncodingBasis.HV, QKDEncodingBasis.DA]
+    # Source rates of 1124.75 and 1124.875 cps: counts 8998 and 8999 at the 8 s integration.
+    game = make_game(
+        FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT, RIGHT], source=RateSequence([1124.75, 1124.875]))
+    )
+
+    response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
+
+    assert response.status_code == HTTPStatus.OK
+    assert game.integration_times == [8.0, 8.0]
+    assert response.json() == [1, 0]
