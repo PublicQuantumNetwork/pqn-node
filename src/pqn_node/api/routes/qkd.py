@@ -62,7 +62,10 @@ class QKDRun(NamedTuple):
 
 
 class UnattendedQKDAnswers(BaseModel):
-    """Both players' Answers to one unattended SSM game, as the GUI sends them: 'a' is left, 'b' is right."""
+    """Both players' Answers to one unattended SSM game, as Whobot sends them.
+
+    The Answers use the same 'a' / 'b' strings the GUI uses: 'a' is left, 'b' is right.
+    """
 
     leader_answers: list[str]
     follower_answers: list[str]
