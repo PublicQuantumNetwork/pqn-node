@@ -16,6 +16,7 @@ import pytest
 from pqn_node.api.main import Calibration
 from pqn_node.api.main import StatedPolarizationAngles
 from pqn_node.api.main import StatedReferenceRates
+from pqn_node.api.routes.qkd import UnattendedQKDAnswers
 from pqn_node.constants import OperationMode
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeApiError
@@ -297,6 +298,13 @@ CALIBRATION_MISSING_A_SECTION = {"polarization_angles": {"h": 1.0, "v": 2.0, "d"
         ("get_calibration", CALIBRATION_MISSING_A_SECTION, "did not answer with a calibration"),
         ("set_calibration", CALIBRATION_MISSING_A_VALUE, "did not answer with a calibration"),
         ("set_calibration", CALIBRATION_MISSING_A_SECTION, "did not answer with a calibration"),
+        # An unattended SSM result is read by its `mode`, so a body without one is refused
+        # rather than guessed at — entanglement-shaped bits and all.
+        ("run_ssm", {"leader_bits": [0], "follower_bits": [0]}, "is not an unattended SSM result"),
+        ("run_ssm", {"mode": "quantum", "leader_bits": [0], "follower_bits": [0]}, "is not an unattended SSM result"),
+        ("run_ssm", 5, "is not an unattended SSM result"),
+        ("run_ssm", {"mode": "correlation", "rates": [1.0]}, "did not answer with an unattended SSM result"),
+        ("run_ssm", {"mode": "entanglement", "leader_bits": [0]}, "did not answer with an unattended SSM result"),
     ],
 )
 def test_a_node_answering_with_the_wrong_shape_is_one_error_type(call: str, payload: object, expected: str) -> None:
@@ -310,6 +318,7 @@ def test_a_node_answering_with_the_wrong_shape_is_one_error_type(call: str, payl
         "set_operation_mode": (OperationMode.CORRELATION, 30.0),
         "get_calibration": (30.0,),
         "set_calibration": (WHOLE_CALIBRATION, 30.0),
+        "run_ssm": (UnattendedQKDAnswers(leader_answers=["a"], follower_answers=["a"]), "10.0.0.5:9000", 30.0),
     }
 
     with pytest.raises(NodeApiError, match=expected):

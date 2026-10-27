@@ -472,6 +472,19 @@ def test_a_str_parameter_becomes_a_single_line_text_field() -> None:
     assert [b["label"]["text"] for b in texts] == ["Leader Answers", "Follower Answers"]
 
 
+def test_the_answer_text_fields_are_optional() -> None:
+    """A cleared Answer field is "no answer", not a form that refuses to submit.
+
+    Leaving one empty falls back to the Action's default (A10), which a required Slack input
+    would never allow the operator to reach.
+    """
+    blocks = WhobotSlack._form_blocks(ssm_action(), {})  # noqa: SLF001
+    texts = [b for b in blocks if b["element"]["type"] == "plain_text_input"]
+
+    assert texts, "the Answers are text fields"
+    assert all(block["optional"] is True for block in texts)
+
+
 def test_a_text_field_reads_back_as_the_actions_str() -> None:
     """Slack sends a text field's value as a plain string, which the Action declared as ``str``."""
     act = ssm_action()

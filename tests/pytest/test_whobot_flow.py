@@ -2061,6 +2061,20 @@ def test_the_ssm_form_opens_on_the_correlation_pattern() -> None:
     assert bot.drawn.initial["questions"] == 8  # noqa: PLR2004 - the config's value
 
 
+def test_an_odd_question_count_gives_the_extra_question_to_left() -> None:
+    """A10: with an odd count the extra one is 'a', so 7 questions read "aaaabbb" on both sides.
+
+    Handing the extra question to the right would read "aaabbbb", changing which basis gets the
+    odd bit and so what the digest's two bases are compared over.
+    """
+    bot = with_node_api(ssm_api(mode="entanglement"), ALICE, ssm_questions=7)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=ALICE)))
+
+    assert bot.drawn.initial["leader_answers"] == "aaaabbb"
+    assert bot.drawn.initial["follower_answers"] == "aaaabbb"
+
+
 def test_the_ssm_form_falls_back_on_its_defaults_when_it_cannot_read_a_mode() -> None:
     """A form opening on defaults beats no form, so a Node that cannot be read must not block it."""
 
@@ -2136,6 +2150,29 @@ def test_upper_case_answers_are_sent_as_lower_case() -> None:
     assert json.loads(request.content) == {"leader_answers": ["a", "b"], "follower_answers": ["a", "b"]}
 
 
+def test_the_ssm_game_is_given_the_per_game_timeout_not_the_node_read_timeout() -> None:
+    """A Game runs for minutes, so its call is bounded by ``per_game_timeout_s``, not the reads'.
+
+    The mode and calibration reads spend ``node_timeout_s``; the game is the long call and must
+    carry the longer bound, or a real game is cut off partway through.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(mode="correlation", unattended=correlated([3000.0], ["high"]), seen=seen),
+        ALICE,
+        node_timeout_s=7.5,
+        per_game_timeout_s=901.0,
+    )
+
+    run_ssm(bot, questions=1, leader_answers="a", follower_answers="a")
+
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    reads = [request for request in seen if request.url.path != "/qkd/unattended"]
+    assert game.extensions["timeout"] == httpx.Timeout(901.0).as_dict()
+    assert reads, "the mode and calibration reads are separate calls"
+    assert all(request.extensions["timeout"] == httpx.Timeout(7.5).as_dict() for request in reads)
+
+
 # --- refusing Answers, without touching the Node ---
 
 
@@ -2166,9 +2203,40 @@ def test_the_ssm_action_refuses_answers_it_cannot_play(form: dict[str, object], 
     assert because in fields["Answers"].value
     assert fields["Operation mode"].value == "entanglement"
     assert [request.url.path for request in seen] == ["/node/operation_mode"], "the game must not start"
+    assert fields["Answers"].status is Status.FAIL, "a refused Answer is a failure, not a warning"
+
+
+@pytest.mark.parametrize(
+    ("leader", "follower"),
+    [("aa", ""), ("", "aa")],
+    ids=["empty follower", "empty leader"],
+)
+def test_one_empty_answer_field_is_refused_rather_than_filled_with_defaults(leader: str, follower: str) -> None:
+    """A10: *both* fields empty means the mode's defaults; one empty is an unequal-length refusal.
+
+    Reading one empty field as "both empty" would silently play the mode's own Answers for a
+    game the operator only half asked for, hiding their mistake instead of reporting it.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE)
+
+    report = run_ssm(bot, questions=2, leader_answers=leader, follower_answers=follower)
+
+    assert report.status is Status.FAIL
+    assert "same length" in {field.name: field for field in ssm_section(report).fields}["Answers"].value
+    assert "/qkd/unattended" not in [request.url.path for request in seen], "no game was played"
 
 
 # --- the report, entanglement mode ---
+
+
+def test_an_entanglement_ssm_report_names_the_node_it_checked() -> None:
+    """An operator runs Run SSM on one Node, so the title must say which leader was checked."""
+    bot = with_node_api(ssm_api(unattended=entangled([0, 1, 0, 1], [0, 1, 0, 1])), ALICE)
+
+    report = run_ssm(bot)
+
+    assert report.title == f"{GAME_TITLES['ssm']} — uiuc-public-left"
 
 
 def test_an_entanglement_ssm_report_shows_the_error_rate_per_basis() -> None:
@@ -2454,6 +2522,33 @@ def test_typed_answers_with_an_unreadable_mode_still_play() -> None:
     assert "/qkd/unattended" in [request.url.path for request in seen]
     # The game's own answer is the authority on the mode, so the report still states it.
     assert {field.name: field for field in ssm_section(report).fields}["Operation mode"].value == "entanglement"
+
+
+def test_a_failed_game_with_an_unreadable_mode_says_the_mode_is_unknown() -> None:
+    """When the Node cannot be read and the game fails, the mode row says "unknown", not a guess.
+
+    Saying "entanglement" would assert a fact nobody established; the report must admit it does
+    not know the mode rather than claim the default.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/node/operation_mode":
+            return httpx.Response(503, json={"detail": "down for maintenance"})
+        if request.url.path == "/qkd/unattended":
+            return httpx.Response(500, json={"detail": "the game did not finish"})
+        return httpx.Response(404)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=2, leader_answers="aa", follower_answers="aa")
+
+    section = ssm_section(report)
+    assert report.status is Status.FAIL
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "unknown"
+    assert "/qkd/unattended" in [request.url.path for request in seen]
 
 
 # --- the partly compared basis: unmatched questions never count (test-reviewer-glm F3) ---
