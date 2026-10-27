@@ -194,6 +194,19 @@ def test_the_shipped_example_config_loads_with_the_documented_defaults(
     assert loaded.correlation_settings.reference_rates == ReferenceRates(vv=3000.0, vd=1500.0, dd=750.0)
 
 
+def test_the_correlation_mode_value_loads_from_its_literal_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 8: the value strings are the API and Whobot contract, and a config writes them literally.
+
+    "entanglement" is already pinned by the example-config test, which loads it from the shipped file.
+    """
+    (tmp_path / "config.toml").write_text('operation_mode = "correlation"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert Settings().operation_mode is OperationMode.CORRELATION
+
+
 def test_the_reference_rate_defaults_expect_a_product_vv_source() -> None:
     """Agent decision A2: VV 1, VD 1/2, DD 1/4 at ~3000 coincidences/s, until an operator sets real ones."""
     rates = ReferenceRates()
@@ -293,6 +306,7 @@ def test_a_named_pin_moves_the_follower_to_its_calibrated_angle(
     response = node.client.post("/chsh/request-angle", params={"angle": named.angle})
 
     assert response.status_code == HTTPStatus.OK
+    assert response.json() is True
     assert node.waveplate.moves == [calibrated[named.value.lower()]]
 
 
@@ -316,6 +330,7 @@ def test_a_custom_pin_keeps_moving_raw(node: FakeNode) -> None:
     response = node.client.post("/chsh/request-angle", params={"angle": 37.5})
 
     assert response.status_code == HTTPStatus.OK
+    assert response.json() is True
     assert node.waveplate.moves == [18.75]
 
 
