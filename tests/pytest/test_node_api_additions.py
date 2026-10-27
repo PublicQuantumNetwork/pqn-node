@@ -55,6 +55,13 @@ REALISTIC_CALIBRATION = {
     "reference_rates": {"vv": 1234567.89, "vd": -13.5, "dd": 750.0},
 }
 
+# Every value with four decimals, so a round trip catches any rounding or truncation on the way
+# into config.toml or back out of the response.
+PRECISE_CALIBRATION = {
+    "polarization_angles": {"h": 0.1234, "v": 112.5678, "d": -21.3719, "a": -22.4321},
+    "reference_rates": {"vv": 2987.6543, "vd": 1499.9876, "dd": 750.1234},
+}
+
 # What a PUT leaves in config.toml when it started from COMMENTED_CONFIG: the operator's own keys,
 # unchanged, plus exactly the keys the endpoint writes.
 BASE_CONFIG = {
@@ -112,10 +119,10 @@ def _calibration_without(value: str) -> dict[str, object]:
     }
 
 
-def _calibration_with_non_numeric(value: str) -> dict[str, object]:
-    """Build a full calibration body with one named value set to a non-numeric string."""
+def _calibration_with(value: str, replacement: object) -> dict[str, object]:
+    """Build a full calibration body with one named value replaced."""
     return {
-        section: {name: "x" if name == value else number for name, number in numbers.items()}
+        section: {name: replacement if name == value else number for name, number in numbers.items()}
         for section, numbers in NEW_CALIBRATION.items()
     }
 
@@ -263,7 +270,7 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
         ),
         # Each value set to a non-numeric string in turn: whatever the field, it must arrive as a number.
         *(
-            pytest.param({"json": _calibration_with_non_numeric(value)}, id=f"{value} non-numeric")
+            pytest.param({"json": _calibration_with(value, "x")}, id=f"{value} non-numeric")
             for value in (*NEW_CALIBRATION["polarization_angles"], *NEW_CALIBRATION["reference_rates"])
         ),
         pytest.param(
@@ -363,6 +370,52 @@ def test_put_calibration_round_trips_realistic_values(client: TestClient, commen
     assert _plain_config(commented_config) == {
         **realistic_config,
         "correlation_settings": {"reference_rates": fractional_dd["reference_rates"]},
+    }
+
+
+@pytest.mark.parametrize(
+    "zeroed",
+    [*(NEW_CALIBRATION["polarization_angles"]), *(NEW_CALIBRATION["reference_rates"])],
+)
+def test_put_calibration_round_trips_a_zero_in_every_field(
+    client: TestClient, commented_config: Path, zeroed: str
+) -> None:
+    """A zero is a value in every field, not "no value": whichever value a PUT zeroes is written.
+
+    Every value starts non-zero, so a write that quietly skips a zeroed value leaves the old
+    number behind — in the response, the live settings and config.toml alike.
+    """
+    assert client.put("/node/calibration", json=NEW_CALIBRATION).status_code == HTTPStatus.OK
+
+    zeroed_calibration = _calibration_with(zeroed, 0.0)
+
+    response = client.put("/node/calibration", json=zeroed_calibration)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == zeroed_calibration
+    assert client.get("/node/calibration").json() == zeroed_calibration
+    assert settings.polarization_angles == PolarizationAngles(**zeroed_calibration["polarization_angles"])
+    assert settings.correlation_settings.reference_rates == ReferenceRates(**zeroed_calibration["reference_rates"])
+    assert _plain_config(commented_config) == {
+        **BASE_CONFIG,
+        "polarization_angles": zeroed_calibration["polarization_angles"],
+        "correlation_settings": {"reference_rates": zeroed_calibration["reference_rates"]},
+    }
+
+
+def test_put_calibration_round_trips_full_precision(client: TestClient, commented_config: Path) -> None:
+    """Every value keeps its full precision: no field is rounded or truncated on its way through the Node."""
+    response = client.put("/node/calibration", json=PRECISE_CALIBRATION)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == PRECISE_CALIBRATION
+    assert client.get("/node/calibration").json() == PRECISE_CALIBRATION
+    assert settings.polarization_angles == PolarizationAngles(**PRECISE_CALIBRATION["polarization_angles"])
+    assert settings.correlation_settings.reference_rates == ReferenceRates(**PRECISE_CALIBRATION["reference_rates"])
+    assert _plain_config(commented_config) == {
+        **BASE_CONFIG,
+        "polarization_angles": PRECISE_CALIBRATION["polarization_angles"],
+        "correlation_settings": {"reference_rates": PRECISE_CALIBRATION["reference_rates"]},
     }
 
 
