@@ -73,6 +73,7 @@ Shown by pqn-gui only when the Node's Operation mode is `correlation` (decision 
 
 | # | Date | Group | Asked by | Question | Decision | Alternatives | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| A4 | 2026-10-27 | 1.2 | Phase orchestrator (test-reviewer-glm, test-reviewer-qwen, Monkey) | `PUT /node/calibration` reuses the settings models, whose fields have defaults, so a partial body is accepted and silently resets the omitted Calibrated angles or Reference rates to their defaults. Accept partial bodies (merging with the current values) or refuse them? | Refuse: the body must carry all four angles and all three rates; anything missing or non-numeric is a 422 that writes nothing. Decision 16 has **Change calibration** send "four angle floats, three rate floats", so a full body is the contract; refusing is the smaller change and cannot reset a value by accident | Partial update merged with the current values (a PATCH-like contract no caller needs); keeping today's silent reset to defaults | Pending |
 | A3 | 2026-10-27 | 1.1 | Phase orchestrator (test-reviewer-glm finding) | `/chsh/request-angle` receives only a float. Should a custom Angle Sweep pin that equals a named polarization's angle (0, 45, 90, 315) move raw, as decision 6 says for custom angles? | No: a pin at exactly a named angle is that named polarization and moves to its Calibrated angle. A test pins this behaviour. Smallest change: the API and Whobot's payload stay as they are (decision 6; Surgical and minimal) | Adding a "named" flag to `/chsh/request-angle` and to Whobot's sweep payload, so a custom 45° stays raw | Pending |
 | A2 | 2026-10-27 | 1.1 | Coder | The plan gives no default Reference rates for `[correlation_settings]`. What should ship? | `vv = 3000`, `vd = 1500`, `dd = 750` coincidences per second: decision 1's expected levels (VV 1, VD ½, DD ¼) scaled to the whiteboard's ≈3K VV (decision 1, rejected alternative). Nothing reads them until Phase 2, and Phase 5 sets real values with **Change calibration** | All 0.0 as an "operator must set" placeholder (every question would then classify to the same level) | Pending |
 | A1 | 2026-10-27 | 1.1 | Phase orchestrator | `ROSTER.md`'s opencode launch commands (`opencode --agent <id>`) fail: opencode on this machine is now v2.0.32, whose TUI rejects `--agent`. How to start opencode workers? | Launch each opencode worker with `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent <id> --model <roster model>`. Checked that the status bar shows `<id> · <model> via Lumen` and that Orca's `worker-start` accepts it. Same agents, models and `opencode.json` permissions as the roster (Workflow "Roles and loop"; `ROSTER.md` model-id note). `ROSTER.md` is not edited; the overall orchestrator was told | Hard stop until Marcos fixes the roster; per-terminal `OPENCODE_CONFIG_CONTENT` `default_agent` (ignored, the TUI uses a background service); `mini` without `--model` (silently runs "Flint 40B Free") | Pending |
@@ -104,7 +105,7 @@ Node settings:
 - [x] Update `configs/config_example.toml`
 
 Node API:
-- [ ] `GET`/`PUT /node/operation_mode` and `GET`/`PUT /node/calibration`, writing `config.toml` through `update_config` and applying live (decision 16)
+- [~] `GET`/`PUT /node/operation_mode` and `GET`/`PUT /node/calibration`, writing `config.toml` through `update_config` and applying live (decision 16)
 
 Whobot:
 - [ ] **Change Operation mode** Action (`Scope.ONE`, enum dropdown, prefilled) (decision 16)
@@ -121,8 +122,9 @@ Tests:
 - [ ] In `correlation` mode, the leader and the follower move to V or D (Calibrated angles) by their own Answer, with no random bit (decision 1)
 - [ ] The leader converts each question's count to a rate using the integration time it measured with, and classifies it by the nearest Reference rate: high or low → agree, medium → disagree (decisions 1, 7)
 - [ ] `n_matching_bits` in correlation mode is the number of questions classified as agree; `QKDResult` keeps its shape (decision 17)
+- [ ] In `correlation` mode the leader never fetches the follower's Answers (`/qkd/request_basis_list`): agreement comes only from the Coincidence levels (decisions 1, 3). Test: the follower mock fails the test if that endpoint is called.
 - [ ] Entanglement mode unchanged (decision 4)
-- [ ] Tests: each Answer combination moves the right angles on each side; classification at, between and beyond each reference; a game end to end with a fake time tagger in both modes
+- [ ] Tests: each Answer combination moves the right angles on each side; classification at, between and beyond each reference; a game end to end with a fake time tagger in both modes; the follower's Answers are never fetched in correlation mode
 
 ### Phase 3: Unattended SSM and the digest (PR 3)
 
