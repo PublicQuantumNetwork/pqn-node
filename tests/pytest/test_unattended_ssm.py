@@ -20,6 +20,7 @@ Coincidence level. The game takes any number of questions, independent of
 # pattern as an unimportable redefinition.
 # ruff: noqa: F401, F811
 
+import asyncio
 import json
 from collections.abc import Callable
 from http import HTTPStatus
@@ -28,10 +29,13 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pqn_hardware.measurement import MeasurementConfig
+from starlette.requests import Request
 
 from pqn_node.api.routes import qkd
+from pqn_node.api.routes.qkd import unattended_follower
 from pqn_node.constants import OperationMode
 from pqn_node.constants import QKDEncodingBasis
 from pqn_node.core.config import NodeRole
@@ -67,14 +71,18 @@ class UnattendedFollower(FakeFollower):
         self,
         *args: Any,
         fail_single_bit: bool = False,
-        fail_follower_bits: bool = False,
+        follower_bits_status: int | None = None,
         fail_reset: bool = False,
+        reset_connection_error: bool = False,
+        fail_takeover: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.fail_single_bit = fail_single_bit
-        self.fail_follower_bits = fail_follower_bits
+        self.follower_bits_status = follower_bits_status
         self.fail_reset = fail_reset
+        self.reset_connection_error = reset_connection_error
+        self.fail_takeover = fail_takeover
         self.takeover: dict[str, Any] | None = None
         self.key_bits: list[int] = []
         self.resets = 0
@@ -89,22 +97,39 @@ class UnattendedFollower(FakeFollower):
         """Answer a coordination call this Node's own reset path makes, or None when the call is not one."""
         if path == "/coordination/reset_coordination_state":
             self.resets += 1
+            if self.reset_connection_error:
+                # A follower that cannot be reached at all: the reset raises rather than answers.
+                message = "the follower is unreachable"
+                raise httpx.ConnectError(message)
             return self._gone() if self.fail_reset else httpx.Response(200, json={"status": "acknowledged"})
         if path == "/coordination/protocol_cancelled":
             self.cancellations += 1
             return httpx.Response(200, json={"status": "acknowledged"})
         return None
 
+    def _answer_takeover(self, request: httpx.Request) -> httpx.Response:
+        """Answer the leader's call that takes this Node into the follower role, recording how it was asked."""
+        if self.fail_takeover:
+            return httpx.Response(503, json="the follower is not taking part")
+        self.takeover = {
+            "leaders_name": request.url.params["leaders_name"],
+            "leaders_port": int(request.url.params["leaders_port"]),
+            "answers": json.loads(request.read()),
+        }
+        return httpx.Response(200, json=True)
+
+    def _answer_follower_bits(self) -> httpx.Response:
+        """Answer the leader's read of this Node's key bits, or the status this double was told to give instead."""
+        if self.follower_bits_status is not None:
+            return httpx.Response(self.follower_bits_status, json="the follower is gone")
+        return httpx.Response(200, json=self.key_bits)
+
     def respond(self, request: httpx.Request) -> httpx.Response | None:
         path = request.url.path
         if path == "/qkd/unattended/follower":
-            self.takeover = {
-                "leaders_name": request.url.params["leaders_name"],
-                "answers": json.loads(request.read()),
-            }
-            return httpx.Response(200, json=True)
+            return self._answer_takeover(request)
         if path == "/qkd/unattended/follower_bits":
-            return self._gone() if self.fail_follower_bits else httpx.Response(200, json=self.key_bits)
+            return self._answer_follower_bits()
         coordination = self._answer_coordination(path)
         if coordination is not None:
             return coordination
@@ -207,7 +232,13 @@ def test_an_unattended_entanglement_game_end_to_end(
         "follower_bits": [1, 0, 1, 0],
     }
     # The follower was put in the follower role with its own Answers, without being asked.
-    assert follower.takeover == {"leaders_name": settings.node_name, "answers": [LEFT, LEFT, RIGHT, RIGHT]}
+    # The port it is told to call back is the one this Node serves on: TestClient's "testserver"
+    # is port 80, so a hard-coded port would not match.
+    assert follower.takeover == {
+        "leaders_name": settings.node_name,
+        "leaders_port": 80,
+        "answers": [LEFT, LEFT, RIGHT, RIGHT],
+    }
     assert_follower_never_asked(follower)
     # Both sides played their own Answers, one handshake per question, and the leader's own
     # bits moved its waveplate: H, V, D, A for choices 0, 1, 0, 1 in the HV, HV, DA, DA bases.
@@ -283,7 +314,11 @@ def test_an_unattended_correlation_game_end_to_end(
         "rates": [3000.0, 1500.0, 1500.0, 750.0],
         "levels": ["high", "medium", "medium", "low"],
     }
-    assert follower.takeover == {"leaders_name": settings.node_name, "answers": [LEFT, RIGHT, LEFT, RIGHT]}
+    assert follower.takeover == {
+        "leaders_name": settings.node_name,
+        "leaders_port": 80,
+        "answers": [LEFT, RIGHT, LEFT, RIGHT],
+    }
     assert_follower_never_asked(follower)
     # One handshake per question, and neither the follower's Answers nor its bits are ever
     # fetched: the photons do all the telling (decision 3).
@@ -374,7 +409,7 @@ def test_an_unattended_entanglement_game_that_fails_fetching_bits_still_resets_c
         mode=OperationMode.ENTANGLEMENT,
         answers=[LEFT, LEFT],
         bits=[1, 0],
-        fail_follower_bits=True,
+        follower_bits_status=500,
         source=RateSequence([3000.0, 3000.0]),
     )
     game = ssm_make_game(follower)
@@ -597,3 +632,200 @@ def test_the_follower_bits_endpoint_returns_its_own_key_bits(
     assert bases.json() == ["HV", "DA", "HV"]
     assert bits.status_code == HTTPStatus.OK
     assert bits.json() == [0, 1, 0]
+
+
+def test_the_unattended_follower_endpoint_keeps_asymmetric_answers_in_order(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    ssm_game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asymmetric follower Answers are stored and played in the order they were sent, not reversed.
+
+    The GUI's Answers are `a`/`b` and left → V, right → D, so a follower told `a, a, b`
+    stores HV, HV, DA and moves its waveplate V, V, D — one move per handshake, in that order.
+    A list stored the other way round would move D, V, V and show up here.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    game = ssm_make_game(UnattendedFollower(mode=OperationMode.CORRELATION, answers=[]))
+
+    takeover = game.client.post(
+        "/qkd/unattended/follower",
+        params={"leaders_name": "the-leader", "leaders_port": 8000},
+        json=[LEFT, LEFT, RIGHT],
+    )
+    handshakes = [game.client.post("/qkd/single_bit") for _ in range(3)]
+
+    assert takeover.status_code == HTTPStatus.OK
+    assert ssm_game_state.qkd_follower_basis_list == [QKDEncodingBasis.HV, QKDEncodingBasis.HV, QKDEncodingBasis.DA]
+    assert all(handshake.status_code == HTTPStatus.OK for handshake in handshakes)
+    # Left → V, left → V, right → D, in that order, one move per question.
+    assert game.plate.moves == [CALIBRATED["v"], CALIBRATED["v"], CALIBRATED["d"]]
+
+
+# --------------------------------------------------------------------------------------
+# The Accept header: a request with no client host.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_unattended_follower_endpoint_without_a_client_host_is_a_400(
+    ssm_game_state: NodeState,
+) -> None:
+    """A request whose scope carries no client host is refused with a 400, before any state changes.
+
+    The leader's address is taken from the caller's host, so a scope that has none cannot be
+    answered; the endpoint says so rather than 500ing on `request.client.host`.
+    """
+    scope = {"type": "http", "method": "POST", "path": "/qkd/unattended/follower", "headers": []}
+    request = Request(scope)
+
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(unattended_follower(request, "the-leader", 8000, [LEFT], ssm_game_state))
+
+    assert raised.value.status_code == HTTPStatus.BAD_REQUEST
+    assert ssm_game_state.role is NodeRole.INDEPENDENT
+    assert ssm_game_state.qkd_follower_basis_list == []
+
+
+# --------------------------------------------------------------------------------------
+# Upper-case Answers: the GUI route always accepted 'A'/'B', and so does the unattended one.
+# --------------------------------------------------------------------------------------
+
+
+def test_upper_case_answers_are_accepted(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'A' and 'B' mean the same as 'a' and 'b', on both the leader's and the follower's endpoint.
+
+    The GUI route accepted either case before the conversion was factored out, so the
+    unattended route keeps accepting them: an upper-case Answer becomes the same basis and
+    the same Calibrated move as its lower-case twin.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([0, 1]))
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2))
+    follower = UnattendedFollower(
+        mode=OperationMode.ENTANGLEMENT,
+        answers=[LEFT, RIGHT],
+        bits=[1, 0],
+        source=RateSequence([3000.0, 3000.0]),
+    )
+    game = ssm_make_game(follower)
+
+    response = run_unattended(game, ["A", "B"], ["A", "B"])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json()["mode"] == "entanglement"
+    assert follower.takeover is not None
+    assert follower.takeover["answers"] == ["A", "B"]
+
+
+def test_the_unattended_follower_endpoint_accepts_upper_case_answers(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    ssm_game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The follower's takeover endpoint accepts 'A'/'B' too, mapping them like 'a'/'b'."""
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([0, 1]))
+    game = ssm_make_game(UnattendedFollower(mode=OperationMode.ENTANGLEMENT, answers=[LEFT, RIGHT], bits=[0, 1]))
+
+    response = game.client.post(
+        "/qkd/unattended/follower",
+        params={"leaders_name": "the-leader", "leaders_port": 8000},
+        json=["A", "B"],
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    assert ssm_game_state.qkd_follower_basis_list == [QKDEncodingBasis.HV, QKDEncodingBasis.DA]
+
+
+# --------------------------------------------------------------------------------------
+# The leader's calls failing: the game stops, the caller learns, coordination resets.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_unattended_game_stops_when_the_follower_cannot_be_set_up(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-200 from the follower's setup call is a 500 that never plays a question.
+
+    Decision 11: the game runs only once the follower has taken the role up. A setup call
+    that fails stops the game before the loop starts, says why, and leaves nothing half-run.
+    """
+    play_without_a_random_bit(monkeypatch)
+    follower = UnattendedFollower(mode=OperationMode.CORRELATION, answers=[LEFT], fail_takeover=True)
+    game = ssm_make_game(follower)
+
+    response = run_unattended(game, [LEFT], [LEFT])
+
+    assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert response.json()["detail"] == "Failed to set up the follower for the unattended game"
+    assert follower.takeover is None
+    paths = [request.url.path for request in follower.requests]
+    assert "/qkd/single_bit" not in paths
+
+
+def test_a_fetch_error_that_is_not_a_500_still_fails_the_game(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    ssm_game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 from the follower's key-bits endpoint is caught like any other non-200.
+
+    The bits are the entanglement game's result; a follower that answers anything but a 200
+    has not handed them over, and the game reports that rather than reading an error body
+    as bits. A 4xx in particular must not slip past the status check.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([0]))
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2))
+    follower = UnattendedFollower(
+        mode=OperationMode.ENTANGLEMENT,
+        answers=[LEFT],
+        bits=[1],
+        follower_bits_status=HTTPStatus.NOT_FOUND,
+        source=RateSequence([3000.0]),
+    )
+    game = ssm_make_game(follower)
+
+    response = run_unattended(game, [LEFT], [LEFT])
+
+    assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert response.json()["detail"] == "Failed to fetch the follower's bits"
+    assert_coordination_reset(follower, ssm_game_state)
+
+
+def test_a_follower_that_cannot_be_reached_for_its_reset_still_lets_the_leader_reset(
+    ssm_make_game: Callable[[FakeFollower], FakePair],
+    ssm_game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection error from the follower's reset does not stop this Node resetting itself.
+
+    Decision 11: coordination is reset on both Nodes. The follower's reset is best-effort, so
+    a follower that cannot be reached at all — the call raising rather than answering — must
+    not leave this Node stuck as leader; the game still returns its result.
+    """
+    play_without_a_random_bit(monkeypatch)
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2))
+    follower = UnattendedFollower(
+        mode=OperationMode.CORRELATION,
+        answers=[LEFT, LEFT],
+        reset_connection_error=True,
+        source=RateSequence([3000.0, 3000.0]),
+    )
+    game = ssm_make_game(follower)
+
+    response = run_unattended(game, [LEFT, LEFT], [LEFT, LEFT])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"mode": "correlation", "rates": [3000.0, 3000.0], "levels": ["high", "high"]}
+    assert follower.resets == 1  # the reset was attempted and raised
+    assert ssm_game_state.role is NodeRole.INDEPENDENT
+    assert ssm_game_state.followers_address == ""
+    assert ssm_game_state.leaders_address == ""
+    assert ssm_game_state.qkd_leader_basis_list == []
+    assert ssm_game_state.qkd_bit_list == []
