@@ -142,13 +142,15 @@ class NodeDigest:
     """One Node's check-up. Not an ``ActionResult``: it is part of one.
 
     Holds ordinary ``Section``s, so every rule about how a result renders is inherited rather
-    than restated. What it adds is the Node the sections belong to.
+    than restated. What it adds is the Node the sections belong to, and the Screenshot taken
+    of its display during the check-up, if one was.
     """
 
     name: str
     api_url: str
     status: Status
     sections: list[Section] = dataclass_field(default_factory=list)
+    image: bytes | None = None
 
 
 @dataclass(frozen=True)

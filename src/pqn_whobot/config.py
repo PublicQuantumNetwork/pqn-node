@@ -93,11 +93,11 @@ class WhobotSettings(BaseSettings):
     # is worked out from this, so raising it cannot cut the report it exists to produce short.
     reboot_wait_s: float = Field(default=300.0, gt=0)
 
-    # Development only: answer the Screenshot Action with this file instead of calling a
-    # Node. Screenshot is the one Action that needs a Node in front of a real display —
-    # X11, KDE and `maim` — which a laptop has none of, so without this the Action cannot
-    # be exercised at all until Phase 8. Set it and Whobot never calls the Node; the report
-    # says so rather than passing the file off as the Node's display.
+    # Development only: answer every Screenshot, the Action's and the Check-up's, with this
+    # file instead of calling a Node. Screenshot is the one thing that needs a Node in front
+    # of a real display — X11, KDE and `maim` — which a laptop has none of, so without this
+    # it cannot be exercised at all. Set it and Whobot never calls the Node for one; the
+    # result says so in a warning rather than passing the file off as the Node's display.
     debug_screenshot_path: Path | None = None
 
     # What a digest run records about itself.

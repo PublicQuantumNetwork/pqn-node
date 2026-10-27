@@ -68,8 +68,9 @@ reboot_wait_s = 300
 
 # Development only. Screenshot is the one Action that needs a Node in front of a real
 # display — X11, KDE and `maim` — so on a laptop it can only ever fail. Point this at any
-# image file and the Screenshot Action answers with it and never calls the Node. The report
-# says as much, in a warning naming this setting, so nobody mistakes the picture for a Node.
+# image file and every Screenshot (the Action's and each Check-up's) is that file, with no call
+# to the Node. The result says as much, in a warning naming this setting, so nobody mistakes
+# the picture for a Node. A Check-up's warning also turns the Daily Digest yellow.
 # Leave it out in production.
 # debug_screenshot_path = "/path/to/some-image.png"
 

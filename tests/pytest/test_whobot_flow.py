@@ -39,6 +39,7 @@ from pqn_whobot.actions import DEFAULT_TIMEOUT_S
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
+from pqn_whobot.actions import Field
 from pqn_whobot.actions import NodeDigest
 from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import ReplyHandle
@@ -917,6 +918,7 @@ HEALTHY = {
     "devices": [{"reachable": True, "provider": "prov", "name": "tagger", "purpose": "counting", "latency_ms": 8.0}],
     "rotary_encoder": None,
     "follower_node": {"reachable": True, "latency_ms": 12.0},
+    "gui": {"reachable": True, "latency_ms": 4.0},
 }
 
 CHSH = {
@@ -948,14 +950,18 @@ ALL_GAMES_ON = {"chsh": True, "qf": True, "ssm": True}
 
 def node_api(
     *,
+    health: object = HEALTHY,
     availability: object = ALL_GAMES_ON,
     refuse: dict[str, int] | None = None,
     seen: list[httpx.Request] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Answer every endpoint a check-up calls, with any of them able to refuse instead."""
+    """Answer every endpoint a check-up calls, with any of them able to refuse instead.
+
+    ``/system/screenshot`` answers with ``PNG``.
+    """
     refusals = refuse or {}
     answers: dict[str, object] = {
-        "/health/": HEALTHY,
+        "/health/": health,
         "/games/availability": availability,
         "/chsh/": CHSH,
         "/chsh/sweep": SWEEP,
@@ -968,6 +974,8 @@ def node_api(
         path = request.url.path
         if path in refusals:
             return httpx.Response(refusals[path], json={"detail": f"{path} is not having it"})
+        if path == "/system/screenshot":
+            return serving_an_image(request)
         if path not in answers:
             return httpx.Response(404)
         return httpx.Response(200, json=answers[path])
@@ -1112,10 +1120,98 @@ def test_an_unreachable_node_is_one_section_and_no_calls() -> None:
 
     digest = checked(bot)
 
-    assert seen == []
+    assert seen == [], "not even a Screenshot: the Node API row already says why"
     assert digest.status is Status.FAIL
     assert len(digest.nodes[0].sections) == 1
     assert "refused" in str(digest.nodes[0].sections[0].error)
+    assert digest.nodes[0].image is None
+
+
+# --- the GUI row and the Screenshot ---
+
+
+def gui_row(digest: DigestResult) -> Field:
+    return next(f for f in sections_of(digest)["Hardware"].fields if f.name == "GUI")
+
+
+def test_a_live_gui_is_a_passing_row_last_in_the_hardware_checklist() -> None:
+    digest = checked(with_node_api(node_api(), ALICE))
+
+    hardware = sections_of(digest)["Hardware"]
+    assert hardware.fields[-1].name == "GUI"
+    assert gui_row(digest).status is Status.OK
+    assert digest.status is Status.OK
+
+
+def test_a_dead_gui_fails_the_node_but_the_games_still_run() -> None:
+    """The GUI is the alarm; the Games still prove the physics works, so they are still measured."""
+    dead = {**HEALTHY, "gui": {"reachable": False, "error": "ConnectError: refused"}}
+
+    digest = checked(with_node_api(node_api(health=dead), ALICE))
+
+    assert gui_row(digest).status is Status.FAIL
+    assert "refused" in gui_row(digest).value
+    assert digest.status is Status.FAIL
+    assert sections_of(digest)[GAME_TITLES["chsh"]].status is Status.OK
+    assert sections_of(digest)[GAME_TITLES["qf"]].status is Status.OK
+
+
+def test_a_gui_that_was_not_probed_is_skipped_not_failed() -> None:
+    """Opted out, or a Node too old to report it: neither is bad news."""
+    unprobed = {key: value for key, value in HEALTHY.items() if key != "gui"}
+
+    digest = checked(with_node_api(node_api(health=unprobed), ALICE))
+
+    assert gui_row(digest).status is Status.SKIPPED
+    assert gui_row(digest).value == "not probed"
+    assert digest.status is Status.OK
+
+
+def test_a_check_up_carries_the_screenshot_and_says_nothing_about_it() -> None:
+    """The picture is posted with the digest; a section saying "it worked" would be noise."""
+    digest = checked(with_node_api(node_api(), ALICE))
+
+    assert digest.nodes[0].image == PNG
+    assert "Screenshot" not in sections_of(digest)
+
+
+def test_the_screenshot_is_taken_after_the_health_probe_and_before_the_games() -> None:
+    """So it shows the Kiosk at rest, and a slow Game cannot eat its time."""
+    seen: list[httpx.Request] = []
+
+    checked(with_node_api(node_api(seen=seen), ALICE))
+
+    paths = [request.url.path for request in seen]
+    assert paths.index("/health/") < paths.index("/system/screenshot") < paths.index("/games/availability")
+
+
+def test_a_failed_screenshot_fails_the_node_but_the_games_still_run() -> None:
+    digest = checked(with_node_api(node_api(refuse={"/system/screenshot": 503}), ALICE))
+
+    screenshot = sections_of(digest)["Screenshot"]
+    assert screenshot.status is Status.FAIL
+    assert "is not having it" in str(screenshot.error)
+    assert digest.nodes[0].image is None
+    assert digest.status is Status.FAIL
+    assert list(sections_of(digest)) == ["Hardware", "Screenshot", *GAME_TITLES.values()]
+    assert sections_of(digest)[GAME_TITLES["chsh"]].status is Status.OK
+
+
+def test_a_check_ups_debug_screenshot_comes_from_the_file_and_warns(tmp_path: Path) -> None:
+    """The same behaviour as the Screenshot Action, so the threaded upload is testable from a laptop."""
+    image = tmp_path / "spongebob.gif"
+    image.write_bytes(GIF)
+    seen: list[httpx.Request] = []
+
+    digest = checked(with_node_api(node_api(seen=seen), ALICE, debug_screenshot_path=image))
+
+    assert "/system/screenshot" not in [request.url.path for request in seen]
+    assert digest.nodes[0].image == GIF
+    screenshot = sections_of(digest)["Screenshot"]
+    assert screenshot.status is Status.WARN
+    assert "not the Node's display" in screenshot.fields[0].value
+    assert "debug_screenshot_path" in str(screenshot.note)
+    assert digest.status is Status.WARN
 
 
 def test_the_configured_measurement_values_are_what_an_unattended_run_uses() -> None:
@@ -1200,10 +1296,13 @@ def test_a_game_action_is_allowed_the_game_plus_the_call_that_starts_it() -> Non
 
 
 def test_checking_a_node_is_allowed_both_its_games() -> None:
-    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody."""
+    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody.
+
+    The three Node calls are the health probe, the Screenshot, and reading availability.
+    """
     settings = settings_for()
 
-    assert one_node_budget(settings) == pytest.approx(2 * 30.0 + 2 * 600.0)
+    assert one_node_budget(settings) == pytest.approx(3 * 30.0 + 2 * 600.0)
     assert FlowSpy.actions["check_node"].timeout_for(settings) == pytest.approx(one_node_budget(settings))
     assert one_node_budget(settings) >= 2 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
 

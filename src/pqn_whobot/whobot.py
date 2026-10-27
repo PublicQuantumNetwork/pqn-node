@@ -84,6 +84,7 @@ import time
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Coroutine
+from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
@@ -179,14 +180,16 @@ def whole_digest_budget(settings: WhobotSettings) -> float:
 
 
 def one_node_budget(settings: WhobotSettings) -> float:
-    """How long checking one Node over may take: two Node calls, then both Games it may play.
+    """How long checking one Node over may take: three Node calls, then both Games it may play.
+
+    The three calls are the health probe, the Screenshot, and reading Game availability.
 
     Derived rather than configured. A ``per_node_timeout_s`` key would be a second statement of
     the same thing, free to disagree with it — and it did: the default was 900s while two Games
     at 600s each need 1200s, so a Node whose Games were merely slow lost both measurements to a
     budget nobody had chosen.
     """
-    return 2 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
+    return 3 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
 
 
 SCHEDULE_BOUNDS = {"hour": (0, 23), "minute": (0, 59)}
@@ -210,6 +213,21 @@ GAME_TITLES = {
     "ssm": "Share a Secret Message",
 }
 """What each Game in ``GamesAvailability`` is called in front of an operator."""
+
+
+@dataclass(frozen=True)
+class _Capture:
+    """One Screenshot attempt: the image, or why there is none.
+
+    Platform-neutral on purpose, so the Screenshot Action and the Check-up word it the same way.
+    ``summary`` is None only for a plain success, which the Action words itself.
+    """
+
+    status: Status
+    image: bytes | None = None
+    summary: str | None = None
+    error: str | None = None
+    note: str | None = None
 
 
 class Whobot(ABC):
@@ -631,55 +649,50 @@ class Whobot(ABC):
         This is the one thing no API probe can tell you: a Node whose every endpoint answers
         correctly can still be sitting in front of a crashed kiosk or a login screen.
         """
-        if self.settings.debug_screenshot_path is not None:
-            return self._debug_screenshot(node, self.settings.debug_screenshot_path)
+        capture = await self._capture_screenshot(node)
+        return Report(
+            status=capture.status,
+            title=f"Screenshot — {node.name}",
+            summary=capture.summary or f"{node.api_url} — {len(capture.image or b'') / 1024:,.0f} KB",
+            sections=[] if capture.error is None else [Section(error=capture.error)],
+            image=capture.image,
+            notes=[] if capture.note is None else [capture.note],
+        )
+
+    async def _capture_screenshot(self, node: Node) -> _Capture:
+        """Take the Node's Screenshot, for the Screenshot Action and the Check-up alike.
+
+        With ``debug_screenshot_path`` set it answers from that file instead and never calls
+        the Node. Screenshot is the one thing that cannot be exercised without a Node in front
+        of a real display, so the setting exists to drive the whole path — the Action, the
+        Check-up, the image on the result, the upload — from a laptop.
+
+        It says so loudly. An image that is not of the Node is worse than no image at all if
+        anyone mistakes it for one, so the capture is a ``WARN`` naming the setting that
+        produced it.
+        """
+        path = self.settings.debug_screenshot_path
+        if path is not None:
+            try:
+                image = path.read_bytes()
+            except OSError as e:
+                return _Capture(
+                    status=Status.FAIL,
+                    summary="debug_screenshot_path is set in whobot.toml, and that file could not be read.",
+                    error=str(e),
+                )
+            return _Capture(
+                status=Status.WARN,
+                summary="This is not the Node's display. Whobot answered from a file and never called the Node.",
+                image=image,
+                note=f"debug_screenshot_path = {path}. Remove it from whobot.toml to screenshot the Node itself.",
+            )
 
         try:
             image = await self._client(node).get_screenshot(self.settings.node_timeout_s)
         except NodeApiError as e:
-            return Report(
-                status=Status.FAIL,
-                title=f"Screenshot — {node.name}",
-                summary="The Node did not return a screenshot.",
-                sections=[Section(error=str(e))],
-            )
-
-        return Report(
-            status=Status.OK,
-            title=f"Screenshot — {node.name}",
-            summary=f"{node.api_url} — {len(image) / 1024:,.0f} KB",
-            image=image,
-        )
-
-    @staticmethod
-    def _debug_screenshot(node: Node, path: Path) -> Report:
-        """Answer with a file from disk instead of calling the Node.
-
-        Screenshot is the one Action that cannot be exercised without a Node in front of a
-        real display, so this exists to drive the whole path — the Action, the image on the
-        result, the upload — from a laptop.
-
-        It says so loudly. An image that is not of the Node is worse than no image at all if
-        anyone mistakes it for one, so the report is a ``WARN`` naming the setting that
-        produced it.
-        """
-        try:
-            image = path.read_bytes()
-        except OSError as e:
-            return Report(
-                status=Status.FAIL,
-                title=f"Screenshot — {node.name}",
-                summary="debug_screenshot_path is set in whobot.toml, and that file could not be read.",
-                sections=[Section(error=str(e))],
-            )
-
-        return Report(
-            status=Status.WARN,
-            title=f"Screenshot — {node.name}",
-            summary="This is not the Node's display. Whobot answered from a file and never called the Node.",
-            image=image,
-            notes=[f"debug_screenshot_path = {path}. Remove it from whobot.toml to screenshot the Node itself."],
-        )
+            return _Capture(status=Status.FAIL, summary="The Node did not return a screenshot.", error=str(e))
+        return _Capture(status=Status.OK, image=image)
 
     @action(
         label="Reboot",
@@ -1014,7 +1027,10 @@ class Whobot(ABC):
     # ----------------------------------------------------------------------------------
 
     async def _probe_node(self, node: Node) -> NodeDigest:
-        """Check one Node's hardware, then the Games it offers.
+        """Check one Node's hardware, take its Screenshot, then play the Games it offers.
+
+        The Screenshot comes before the Games so that it shows the Kiosk at rest, as a visitor
+        sees it, and so that a slow Game cannot eat its time.
 
         Every failure is a section rather than an exception, because a digest of four Nodes must
         not be lost to one of them being unplugged. Whoever calls this bounds it per Node.
@@ -1034,6 +1050,11 @@ class Whobot(ABC):
         except NodeApiError as e:
             sections = [_failed_section("Hardware", "The hardware probe failed.", str(e))]
 
+        capture = await self._capture_screenshot(node)
+        screenshot = _screenshot_section(capture)
+        if screenshot is not None:
+            sections.append(screenshot)
+
         sections += await self._play_games(node)
 
         return NodeDigest(
@@ -1041,6 +1062,7 @@ class Whobot(ABC):
             api_url=node.api_url,
             status=Status.overall(section.status for section in sections),
             sections=sections,
+            image=capture.image,
         )
 
     async def _play_games(self, node: Node) -> list[Section]:
@@ -1204,8 +1226,30 @@ def _hardware_section(health: HealthStatus) -> Section:
         fields.append(_component_field("Rotary encoder", health.rotary_encoder))
     if health.follower_node is not None:
         fields.append(_component_field("Follower Node", health.follower_node))
+    if health.gui is None:
+        # Opted out with an empty gui_address, or a Node too old to report it.
+        fields.append(Field(name="GUI", value="not probed", status=Status.SKIPPED))
+    else:
+        fields.append(_component_field("GUI", health.gui))
 
     return Section(label="Hardware", status=Status.overall(f.status for f in fields), fields=fields)
+
+
+def _screenshot_section(capture: _Capture) -> Section | None:
+    """Describe a Check-up's Screenshot, or nothing when it simply worked.
+
+    A working one needs no words: the picture itself is posted with the digest.
+    """
+    if capture.status is Status.OK:
+        return None
+    if capture.error is not None:
+        return _failed_section("Screenshot", capture.summary or "", capture.error)
+    return Section(
+        label="Screenshot",
+        status=capture.status,
+        fields=[Field(name="Result", value=capture.summary or "", status=capture.status)],
+        note=capture.note,
+    )
 
 
 def _failed_section(label: str, summary: str, error: str, elapsed_s: float | None = None) -> Section:
