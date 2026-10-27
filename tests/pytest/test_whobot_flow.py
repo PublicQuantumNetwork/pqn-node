@@ -1410,7 +1410,9 @@ def test_a_healthy_node_reports_its_hardware_its_mode_and_every_game() -> None:
     digest = checked(with_node_api(node_api(), ALICE))
 
     assert digest.status is Status.OK
-    assert list(sections_of(digest)) == ["Hardware", OPERATION_MODE_LABEL, *GAME_TITLES.values()]
+    # The literal heading is named, so a rename of the section is a failed test rather than a
+    # silently different report for the operator.
+    assert list(sections_of(digest)) == ["Hardware", "Operation mode", *GAME_TITLES.values()]
     chsh = sections_of(digest)[GAME_TITLES["chsh"]]
     assert next(f.value for f in chsh.fields if f.name == "S") == "2.6135 ± 0.0400"
     assert chsh.note is not None, "a Game reports how long it took"
@@ -1499,14 +1501,21 @@ def test_a_config_read_that_fails_warns_the_follower_row_and_asks_no_follower() 
 
 
 def test_a_matching_follower_mode_is_shown_without_a_warning() -> None:
-    """Decision 9: only a *difference* is a mistake worth flagging."""
-    digest = checked(with_node_api(node_api(mode="correlation", follower="10.0.0.9"), ALICE))
+    """Decision 9: only a *difference* is a mistake worth flagging.
+
+    The follower is asked at ``http://<address>/node/operation_mode`` (A13): Nodes serve plain
+    HTTP, so an https request would never be answered and every follower would read as unknown.
+    """
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(mode="correlation", follower="10.0.0.9", seen=seen), ALICE))
 
     section = sections_of(digest)[OPERATION_MODE_LABEL]
     follower = next(field for field in section.fields if field.name == "Follower mode")
     assert follower.status is Status.OK
     assert follower.value == "correlation"
     assert section.status is Status.OK
+    follower_request = next(request for request in seen if request.url.host == "10.0.0.9")
+    assert str(follower_request.url) == "http://10.0.0.9/node/operation_mode"
 
 
 def test_a_follower_in_a_different_mode_warns_and_names_both() -> None:
@@ -1545,6 +1554,23 @@ def test_no_configured_follower_is_said_without_a_warning() -> None:
     assert [request.url.path for request in seen].count("/node/config") == 1
 
 
+def test_an_empty_follower_address_is_treated_as_none_configured() -> None:
+    """A13: an empty address is a Node with no follower — not one at an empty host.
+
+    Otherwise the row would WARN "unknown at :", and Whobot would try to open a connection to a
+    host that does not exist.
+    """
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(follower="", seen=seen), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "none configured"
+    assert section.status is Status.OK
+    assert {request.url.host for request in seen} == {"node-a.invalid"}, "no empty-host follower was asked"
+
+
 def test_the_digests_ssm_check_follows_the_nodes_mode() -> None:
     """Decision 13: the digest's SSM check is the mode's — correlation reports rates vs references."""
     seen: list[httpx.Request] = []
@@ -1564,6 +1590,27 @@ def test_the_digests_ssm_check_follows_the_nodes_mode() -> None:
     assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "correlation"
     assert ssm.status is Status.OK
     assert "/node/calibration" in [request.url.path for request in seen], "correlation shows rates vs references"
+
+
+def test_the_digest_ssm_game_uses_the_configured_question_count_and_no_integration_time() -> None:
+    """The digest plays ``ssm_questions`` questions and sends no integration time (decision 13, A9).
+
+    A non-default count is used so a hard-coded number would fail, and A9's "no time" is pinned by
+    the absence of ``integration_time_s``: the Node then measures as its GUI game does.
+    """
+    seen: list[httpx.Request] = []
+    checked(
+        with_node_api(
+            node_api(unattended=entangled([0] * 6, [0] * 6), seen=seen),
+            ALICE,
+            ssm_questions=6,
+        )
+    )
+
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    body = json.loads(game.content)
+    assert body == {"leader_answers": ["a"] * 3 + ["b"] * 3, "follower_answers": ["a"] * 3 + ["b"] * 3}
+    assert "integration_time_s" not in game.url.params
 
 
 def test_the_digests_ssm_status_follows_the_configured_max_error_rate() -> None:
