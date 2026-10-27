@@ -23,6 +23,7 @@ from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import Report
 from pqn_whobot.actions import Section
 from pqn_whobot.actions import Status
+from pqn_whobot.actions import action
 from pqn_whobot.actions import scan_actions
 from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
@@ -487,13 +488,21 @@ def test_a_text_field_reads_back_as_the_actions_str() -> None:
 
 
 def test_a_text_field_left_empty_falls_back_to_the_actions_default() -> None:
-    """Like a number input, an empty text field is no answer rather than the empty string."""
-    act = ssm_action()
-    state = {
-        _param_block("leader_answers"): {_param_block("leader_answers"): {"type": "plain_text_input", "value": ""}}
-    }
+    """Like a number input, an empty text field is no answer rather than the empty string.
 
-    assert act.coerce_params(WhobotSlack._read_form(act, state))["leader_answers"] == ""  # noqa: SLF001
+    The Action's default is deliberately non-empty: Run SSM's own default for its Answers is
+    already "", so an assertion on that could not tell ``_read_form``'s guard from its absence.
+    """
+
+    class Typed:
+        @action(label="Typed")
+        async def typed(self, *, answers: str = "ab") -> Report:
+            return Report(status=Status.OK, title="typed")
+
+    act = scan_actions(Typed)["typed"]
+    state = {_param_block("answers"): {_param_block("answers"): {"type": "plain_text_input", "value": ""}}}
+
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"answers": "ab"}  # noqa: SLF001
 
 
 def test_a_number_input_reads_back_as_the_actions_float() -> None:

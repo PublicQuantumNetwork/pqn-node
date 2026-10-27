@@ -168,6 +168,17 @@ def one_game_budget(settings: WhobotSettings) -> float:
     return settings.node_timeout_s + settings.per_game_timeout_s
 
 
+def ssm_budget(settings: WhobotSettings) -> float:
+    """How long Run SSM may take: the Game plus the two Node reads around it.
+
+    More than ``one_game_budget`` because, unlike Run CHSH, it reads the Node's Operation mode
+    and — in correlation mode — its Reference rates as well as playing the game, and the report
+    must not be thrown away as "Timed out" after the game has already run. The sum is what it
+    spends: two node calls and one Game.
+    """
+    return 2 * settings.node_timeout_s + settings.per_game_timeout_s
+
+
 def sweep_csv_path() -> Path:
     """Where every Angle Sweep's data is kept: beside ``whobot.toml``, untracked like it."""
     return config_path().parent / "whobot_sweeps.csv"
@@ -521,7 +532,7 @@ class Whobot(ABC):
         label="Run SSM",
         description="Play one unattended Share a Secret Message game on a Node, with both players' Answers.",
         scope=Scope.ONE,
-        timeout_s=one_game_budget,
+        timeout_s=ssm_budget,
     )
     async def run_ssm(  # noqa: PLR0913 - the form asks one field per default an operator may override (decision 14)
         self,
@@ -1307,7 +1318,7 @@ class Whobot(ABC):
         """Play one unattended SSM game and describe how it went, or why it could not.
 
         Shared by Run SSM and the digest (decision 13): the leader runs the game, and the
-        section shows the mode and either the per-basis error rate (entanglement) or each
+        section states the mode and either the per-basis error rate (entanglement) or each
         question's measured rate beside its Reference rate and expected level (correlation).
         Empty Answer fields mean the mode's own pattern for ``questions`` questions, so the
         digest — which picks no Answers — need not know them; ``mode`` lets a caller that has
@@ -1316,16 +1327,32 @@ class Whobot(ABC):
         label = GAME_TITLES["ssm"]
         started = time.monotonic()
         leader, follower = leader_answers.strip().lower(), follower_answers.strip().lower()
-        if not leader and not follower:
+
+        # The mode is read once up front, because every section states it and the default
+        # Answers need it (decision 13). A Node that will not answer leaves the mode unknown:
+        # the failure is the report's if there were no Answers to play with, and otherwise the
+        # game still runs, since the Node decides the mode it actually plays in.
+        mode_error: NodeApiError | None = None
+        if mode is None:
             try:
-                mode = mode or await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+                mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
             except NodeApiError as e:
-                return _failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)
+                mode_error = e
+
+        if not leader and not follower:
+            if mode is None:
+                return _failed_section(
+                    label, "The Game did not complete.", str(mode_error), time.monotonic() - started, "unknown"
+                )
             leader, follower = _ssm_default_answers(mode, questions)
+        elif mode is None:
+            # There are Answers to play, so an unreadable mode only leaves the report's own
+            # mode row unknown; the Node still decides the mode the game actually plays in.
+            logger.warning("%s: could not read the Operation mode for the SSM report: %s", node.name, mode_error)
 
         problem = _ssm_answers_problem(questions, leader, follower)
         if problem is not None:
-            return _refused_section(label, problem)
+            return _refused_section(label, problem, _ssm_mode_value(mode))
 
         try:
             result = await self._client(node).run_ssm(
@@ -1335,7 +1362,9 @@ class Whobot(ABC):
                 None if integration_time_s <= 0 else integration_time_s,
             )
         except NodeApiError as e:
-            return _failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)
+            return _failed_section(
+                label, "The Game did not complete.", str(e), time.monotonic() - started, _ssm_mode_value(mode)
+            )
 
         references = None
         if result.mode is OperationMode.CORRELATION:
@@ -1433,12 +1462,22 @@ def _hardware_section(health: HealthStatus) -> Section:
     return Section(label="Hardware", status=Status.overall(f.status for f in fields), fields=fields)
 
 
-def _failed_section(label: str, summary: str, error: str, elapsed_s: float | None = None) -> Section:
-    """Describe something that was attempted and did not work."""
+def _failed_section(
+    label: str, summary: str, error: str, elapsed_s: float | None = None, mode_value: str | None = None
+) -> Section:
+    """Describe something that was attempted and did not work.
+
+    ``mode_value`` prepends the Operation mode row an SSM section must carry even when it fails
+    (decision 13); it is ``None`` for every caller that is not SSM, and "unknown" when the Node
+    could not be asked.
+    """
+    fields = [Field(name="Result", value=summary, status=Status.FAIL)]
+    if mode_value is not None:
+        fields.insert(0, Field(name="Operation mode", value=mode_value))
     return Section(
         label=label,
         status=Status.FAIL,
-        fields=[Field(name="Result", value=summary, status=Status.FAIL)],
+        fields=fields,
         note=None if elapsed_s is None else f"{elapsed_s:.1f}s",
         error=error,
     )
@@ -1469,17 +1508,22 @@ def _skipped_section(label: str, reason: str) -> Section:
     return Section(label=label, status=Status.SKIPPED, fields=[Field(name="Skipped", value=reason)])
 
 
-def _refused_section(label: str, reason: str) -> Section:
+def _refused_section(label: str, reason: str, mode_value: str | None = None) -> Section:
     """Describe an Action that refused its input before touching a Node.
 
     A game that never started is a ``FAIL``: the operator asked for something that could not
-    happen, and no measurement came back to soften it.
+    happen, and no measurement came back to soften it. ``mode_value`` is as in
+    ``_failed_section``: SSM states its Operation mode on every section (decision 13).
     """
-    return Section(
-        label=label,
-        status=Status.FAIL,
-        fields=[Field(name="Answers", value=reason, status=Status.FAIL)],
-    )
+    fields = [Field(name="Answers", value=reason, status=Status.FAIL)]
+    if mode_value is not None:
+        fields.insert(0, Field(name="Operation mode", value=mode_value))
+    return Section(label=label, status=Status.FAIL, fields=fields)
+
+
+def _ssm_mode_value(mode: OperationMode | None) -> str:
+    """Render the Operation mode row's value, saying "unknown" when the Node could not be asked."""
+    return mode.value if mode is not None else "unknown"
 
 
 LEFT = "a"
@@ -1630,17 +1674,17 @@ def _ssm_correlation_section(
         expected = _ssm_expected_level(ours, theirs)
         measured = result.levels[index]
         rate = result.rates[index]
+        # Decision 13: OK when every question gets its expected Coincidence level, WARN
+        # otherwise. That is the level comparison alone; the Reference rate is shown beside the
+        # measured one, and its absence is reported in the value rather than changing the verdict.
         if references is None:
-            # The Node would not say what to measure against, so the rate cannot be shown beside
-            # its Reference rate as decision 13 requires. That is a degraded report, not a bad
-            # game, so the row WARNs while still showing everything that was measured.
             reference = "reference unknown"
-            status = Status.WARN
         else:
             reference = f"reference {_ssm_reference_rate(references, expected):g}"
-            status = Status.OK if measured is expected else Status.WARN
         value = f"{rate:g} cps, {reference}, measured {measured.value}, expected {expected.value}"
-        fields.append(Field(name=f"Q{index + 1}", value=value, status=status))
+        fields.append(
+            Field(name=f"Q{index + 1}", value=value, status=Status.OK if measured is expected else Status.WARN)
+        )
 
     return Section(
         label=GAME_TITLES["ssm"],
