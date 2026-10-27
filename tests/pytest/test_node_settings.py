@@ -55,6 +55,15 @@ hwp = ["provider", "instrument_hwp"]
 request_hwp = ["provider", "instrument_hwp"]
 """
 
+CONFIG_EXAMPLE = Path(__file__).parents[2] / "configs" / "config_example.toml"
+
+TODAYS_ANGLES = PolarizationAngles(
+    h=float(QKDAngleValuesHWP.H.value),
+    v=float(QKDAngleValuesHWP.V.value),
+    d=float(QKDAngleValuesHWP.D.value),
+    a=float(QKDAngleValuesHWP.A.value),
+)
+
 WRITTEN_ANGLES = {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5}
 WRITTEN_RATES = {"vv": 11.0, "vd": 12.0, "dd": 13.0}
 NEW_KEYS = {
@@ -168,12 +177,21 @@ def test_a_config_without_the_new_keys_behaves_as_today(tmp_path: Path, monkeypa
     loaded = Settings()
 
     assert loaded.operation_mode is OperationMode.ENTANGLEMENT
-    assert loaded.polarization_angles == PolarizationAngles(
-        h=float(QKDAngleValuesHWP.H.value),
-        v=float(QKDAngleValuesHWP.V.value),
-        d=float(QKDAngleValuesHWP.D.value),
-        a=float(QKDAngleValuesHWP.A.value),
-    )
+    assert loaded.polarization_angles == TODAYS_ANGLES
+
+
+def test_the_shipped_example_config_loads_with_the_documented_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The example operators copy must load, and it ships the documented defaults (agent decision A2)."""
+    (tmp_path / "config.toml").write_text(CONFIG_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    loaded = Settings()
+
+    assert loaded.operation_mode is OperationMode.ENTANGLEMENT
+    assert loaded.polarization_angles == TODAYS_ANGLES
+    assert loaded.correlation_settings.reference_rates == ReferenceRates(vv=3000.0, vd=1500.0, dd=750.0)
 
 
 def test_the_reference_rate_defaults_expect_a_product_vv_source() -> None:
@@ -276,6 +294,21 @@ def test_a_named_pin_moves_the_follower_to_its_calibrated_angle(
 
     assert response.status_code == HTTPStatus.OK
     assert node.waveplate.moves == [calibrated[named.value.lower()]]
+
+
+@pytest.mark.parametrize(("nominal", "name"), [(0.0, "h"), (45.0, "d"), (90.0, "v"), (315.0, "a")])
+def test_a_custom_pin_at_a_nominal_angle_still_moves_calibrated(
+    node: FakeNode, calibrated: dict[str, float], nominal: float, name: str
+) -> None:
+    """A "custom" pin at exactly a nominal angle still moves to the Calibrated angle.
+
+    Agent decision A3: the endpoint only receives a float, so a pin at 0, 45, 90 or 315 degrees —
+    the nominal H/V/D/A polarization angles — is that named polarization, whatever the form sent.
+    """
+    response = node.client.post("/chsh/request-angle", params={"angle": nominal})
+
+    assert response.status_code == HTTPStatus.OK
+    assert node.waveplate.moves == [calibrated[name]]
 
 
 def test_a_custom_pin_keeps_moving_raw(node: FakeNode) -> None:

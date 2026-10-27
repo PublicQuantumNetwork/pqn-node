@@ -229,12 +229,11 @@ async def request_angle(angle: float) -> bool:
     H, V, D and A — what an Angle Sweep pins the follower at — move to their Calibrated angles;
     a custom angle keeps moving raw, at half the polarization angle.
     """
-    hwp = find_rotator(settings.chsh_settings.request_hwp)
     named = QKDAngleValuesHWP.from_polarization_angle(angle)
     if named is None:
-        move_to_polarization(hwp, angle)
-    else:
-        hwp.move_to(settings.polarization_angles.waveplate_angle(named))
+        return _move_request_hwp(angle)
+    hwp = find_rotator(settings.chsh_settings.request_hwp)
+    hwp.move_to(settings.polarization_angles.waveplate_angle(named))
     logger.info("moving waveplate", extra={"angle": angle})
     return True
 

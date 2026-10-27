@@ -192,10 +192,11 @@ def outbound() -> Iterator[list[httpx.Request]]:
 def test_request_angle_moves_the_requested_plate_to_half_the_angle(
     client: TestClient, waveplate: FakeWaveplate
 ) -> None:
-    response = client.post("/chsh/request-angle", params={"angle": 45.0})
+    """A custom angle, one no named polarization sits at, moves raw: half the polarization angle."""
+    response = client.post("/chsh/request-angle", params={"angle": 37.5})
 
     assert response.status_code == HTTPStatus.OK
-    assert waveplate.moves == [22.5]
+    assert waveplate.moves == [18.75]
 
 
 def test_request_angle_by_basis_moves_to_half_the_basis_angle_plus_90_when_perp(
