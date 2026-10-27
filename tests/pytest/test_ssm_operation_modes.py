@@ -421,6 +421,25 @@ def test_classification_follows_the_configured_reference_rates(monkeypatch: pyte
     assert _coincidence_level(5000.0) is CoincidenceLevel.HIGH
 
 
+def test_classification_keeps_the_reference_rates_full_precision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Classify by fractional Reference rates exactly as they are set, not truncated or rounded.
+
+    Any float is a valid Reference rate (decision 16, agent decision A5), and the midpoints
+    move with the fractions: with VV 3000.6, VD 1503.4 and DD 750.2 the VV/VD midpoint is
+    2252.0 and the VD/DD one 1126.8, so a rate just below either lands on the lower side.
+    """
+    rates = settings.correlation_settings.reference_rates
+    monkeypatch.setattr(rates, "vv", 3000.6)
+    monkeypatch.setattr(rates, "vd", 1503.4)
+    monkeypatch.setattr(rates, "dd", 750.2)
+
+    assert _coincidence_level(3000.6) is CoincidenceLevel.HIGH
+    assert _coincidence_level(1503.4) is CoincidenceLevel.MEDIUM
+    assert _coincidence_level(750.2) is CoincidenceLevel.LOW
+    assert _coincidence_level(2251.85) is CoincidenceLevel.MEDIUM
+    assert _coincidence_level(1125.95) is CoincidenceLevel.LOW
+
+
 # --------------------------------------------------------------------------------------
 # A game end to end, in both Operation modes.
 # --------------------------------------------------------------------------------------
@@ -506,6 +525,33 @@ def test_an_entanglement_game_end_to_end(
     assert game_state.qkd_bit_list == [0, 1, 0, 1]
     assert follower.results == [response.json()]
     # Today's game still fetches the follower's Answers.
+    assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
+
+
+def test_an_entanglement_game_where_no_answer_matches(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entanglement game where no Answer matches reports zero matching bits (decision 4).
+
+    Every question picks a different basis on the two sides, so the leader's fetch of the
+    follower's Answers finds nothing to keep and today's count is an honest 0.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([0, 1]))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 2)
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(mode=OperationMode.ENTANGLEMENT, answers=[RIGHT, RIGHT], bits=[0, 1])
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, [LEFT, LEFT])
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"n_matching_bits": 0, "n_total_bits": 2, "emoji": "🙈", "role": "leader"}
+    assert follower.results == [response.json()]
     assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
 
 
@@ -644,3 +690,27 @@ def test_the_rate_keeps_its_full_precision_through_the_game(
     assert response.status_code == HTTPStatus.OK
     assert game.integration_times == [8.0, 8.0]
     assert response.json() == [1, 0]
+
+
+def test_a_fractional_integration_time_divides_the_count_exactly(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fractional integration time is divided out exactly as it was measured with.
+
+    A source giving 1000 cps over the configured 2.5 s counts 2500, whose rate is 1000 cps
+    (low → agreed); dividing by a rounded or truncated 2 s instead would give 1250 cps
+    (medium → disagreed).
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2.5))
+    game_state.qkd_leader_basis_list = [QKDEncodingBasis.HV]
+    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT], source=RateSequence([1000.0])))
+
+    response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
+
+    assert response.status_code == HTTPStatus.OK
+    assert game.integration_times == [2.5]
+    assert response.json() == [1]
