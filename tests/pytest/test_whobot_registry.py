@@ -13,6 +13,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from pqn_node.api.main import Calibration
+from pqn_node.api.main import StatedPolarizationAngles
+from pqn_node.api.main import StatedReferenceRates
+from pqn_node.constants import OperationMode
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
@@ -252,6 +256,21 @@ def test_running_a_fortune_leaves_the_nodes_own_calibration_alone() -> None:
     assert drawn == [42, 137]
 
 
+# A calibration that states every value, for the wrong-shape rows that send one.
+WHOLE_CALIBRATION = Calibration(
+    polarization_angles=StatedPolarizationAngles(h=1.0, v=2.0, d=3.0, a=4.0),
+    reference_rates=StatedReferenceRates(vv=1.0, vd=2.0, dd=3.0),
+)
+
+# A calibration answer missing one value, and one missing a whole section: the Node states
+# every value (agent decision A4), so neither may be filled in from defaults here.
+CALIBRATION_MISSING_A_VALUE = {
+    "polarization_angles": {"h": 1.0, "v": 2.0, "d": 3.0},
+    "reference_rates": {"vv": 1.0, "vd": 2.0, "dd": 3.0},
+}
+CALIBRATION_MISSING_A_SECTION = {"polarization_angles": {"h": 1.0, "v": 2.0, "d": 3.0, "a": 4.0}}
+
+
 @pytest.mark.parametrize(
     ("call", "payload", "expected"),
     [
@@ -259,6 +278,25 @@ def test_running_a_fortune_leaves_the_nodes_own_calibration_alone() -> None:
         ("run_chsh", {"chsh_value": "not a number"}, "did not answer with a CHSH result"),
         ("run_fortune", {"fortune": [1, 2]}, "is not a fortune per channel"),
         ("run_fortune", ["not", "numbers"], "is not a fortune per channel"),
+        # Anything but one of the two modes' own strings is refused, on the way out of a GET
+        # as on the way back from a PUT: a wrong-case or padded string is other code running
+        # on the Node, not a mode to interpret.
+        ("get_operation_mode", {}, "is not an Operation mode"),
+        ("get_operation_mode", 5, "is not an Operation mode"),
+        ("get_operation_mode", "quantum", "did not answer with an Operation mode"),
+        ("get_operation_mode", "CORRELATION", "did not answer with an Operation mode"),
+        ("get_operation_mode", " correlation ", "did not answer with an Operation mode"),
+        ("get_operation_mode", "", "did not answer with an Operation mode"),
+        ("set_operation_mode", {}, "is not an Operation mode"),
+        ("set_operation_mode", 5, "is not an Operation mode"),
+        ("set_operation_mode", "quantum", "did not answer with an Operation mode"),
+        ("set_operation_mode", "CORRELATION", "did not answer with an Operation mode"),
+        ("set_operation_mode", " correlation ", "did not answer with an Operation mode"),
+        ("set_operation_mode", "", "did not answer with an Operation mode"),
+        ("get_calibration", CALIBRATION_MISSING_A_VALUE, "did not answer with a calibration"),
+        ("get_calibration", CALIBRATION_MISSING_A_SECTION, "did not answer with a calibration"),
+        ("set_calibration", CALIBRATION_MISSING_A_VALUE, "did not answer with a calibration"),
+        ("set_calibration", CALIBRATION_MISSING_A_SECTION, "did not answer with a calibration"),
     ],
 )
 def test_a_node_answering_with_the_wrong_shape_is_one_error_type(call: str, payload: object, expected: str) -> None:
@@ -268,6 +306,10 @@ def test_a_node_answering_with_the_wrong_shape_is_one_error_type(call: str, payl
         "get_health": (30.0,),
         "run_chsh": ("10.0.0.5:9000", (0.0, 22.5), 30.0),
         "run_fortune": ("10.0.0.5:9000", 30.0),
+        "get_operation_mode": (30.0,),
+        "set_operation_mode": (OperationMode.CORRELATION, 30.0),
+        "get_calibration": (30.0,),
+        "set_calibration": (WHOLE_CALIBRATION, 30.0),
     }
 
     with pytest.raises(NodeApiError, match=expected):
