@@ -132,6 +132,8 @@ The endpoint returns before the machine goes down, so the caller gets a response
 
 See [pqn-gui](https://github.com/PublicQuantumNetwork/pqn-gui) for install and start instructions.
 
+`GET /health` also probes the GUI with a plain `GET http://<gui_address>/` (default `localhost:3000`, where `next start` listens) and reports it as `gui`. A dead GUI does not switch any games off, since the API and hardware still work, but Whobot's Daily Digest marks the Node FAIL. A Node that runs no GUI opts out with `gui_address = ""` in `config.toml`, and `gui` is then `null`.
+
 ## Whobot
 
 Whobot is how you operate a Network from Slack. It is the second deployable in this repo

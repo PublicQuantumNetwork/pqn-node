@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     virtual_rotator: bool = False  # If True, use terminal input instead of hardware rotary encoder
     games_availability: GamesAvailability = Field(default_factory=GamesAvailability)
     follower_node_address: str | None = None
+    # Where the Node's own GUI (pqn-gui) listens; `/health` probes it. Empty or None means not probed.
+    gui_address: str | None = "localhost:3000"
 
     model_config = SettingsConfigDict(
         toml_file="./config.toml",
