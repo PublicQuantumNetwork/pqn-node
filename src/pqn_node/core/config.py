@@ -18,6 +18,8 @@ from pydantic_settings import SettingsConfigDict
 from pydantic_settings import TomlConfigSettingsSource
 
 from pqn_node.constants import BellState
+from pqn_node.constants import OperationMode
+from pqn_node.constants import QKDAngleValuesHWP
 from pqn_node.constants import QKDEncodingBasis
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,47 @@ class GamesAvailability(BaseModel):
     ssm: bool = True  # "Share a Secret Message"
 
 
+class PolarizationAngles(BaseModel):
+    """The Calibrated angles: the waveplate angles this Node moves to for H, V, D and A.
+
+    Waveplate angles, not polarization angles: what the half waveplate is told to move to.
+    The defaults are today's ``QKDAngleValuesHWP`` values, so a Node that has not set its
+    Calibrated angles moves exactly as it always has.
+    """
+
+    h: float = float(QKDAngleValuesHWP.H.value)
+    v: float = float(QKDAngleValuesHWP.V.value)
+    d: float = float(QKDAngleValuesHWP.D.value)
+    a: float = float(QKDAngleValuesHWP.A.value)
+
+    def waveplate_angle(self, polarization: QKDAngleValuesHWP) -> float:
+        """Return the Calibrated angle to move the waveplate to for one of the four named polarizations."""
+        return {
+            QKDAngleValuesHWP.H: self.h,
+            QKDAngleValuesHWP.V: self.v,
+            QKDAngleValuesHWP.D: self.d,
+            QKDAngleValuesHWP.A: self.a,
+        }[polarization]
+
+
+class ReferenceRates(BaseModel):
+    """The Reference rates: the coincidences per second a leading Node expects for VV, VD and DD.
+
+    The defaults are the expected relative levels of a product-VV source (VV 1, VD 1/2, DD 1/4)
+    at ~3000 coincidences/s, until an operator sets the real ones.
+    """
+
+    vv: float = 3000.0
+    vd: float = 1500.0
+    dd: float = 750.0
+
+
+class CorrelationSettings(BaseModel):
+    """Settings the correlation Operation mode reads."""
+
+    reference_rates: ReferenceRates = Field(default_factory=ReferenceRates)
+
+
 class Settings(BaseSettings):
     node_name: str = "node1"
     router_name: str = "router1"
@@ -60,7 +103,10 @@ class Settings(BaseSettings):
     chsh_settings: CHSHSettings = CHSHSettings()
     qkd_settings: QKDSettings = QKDSettings()
     rng_settings: RNGSettings = RNGSettings()
+    polarization_angles: PolarizationAngles = Field(default_factory=PolarizationAngles)
+    correlation_settings: CorrelationSettings = Field(default_factory=CorrelationSettings)
     bell_state: BellState = BellState.Phi_plus
+    operation_mode: OperationMode = OperationMode.ENTANGLEMENT
     timetagger: tuple[str, str] | None = None  # Name of the timetagger to use for the CHSH experiment.
     rotary_encoder_address: str = "/dev/ttyACM0"
     virtual_rotator: bool = False  # If True, use terminal input instead of hardware rotary encoder

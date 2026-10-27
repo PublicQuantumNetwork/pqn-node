@@ -60,8 +60,8 @@ async def _qkd(
         int_choice = secrets.randbits(1)  # FIXME: Make this real quantum random.
         logger.debug("Chosen integer choice: %s", int_choice)
         state.qkd_bit_list.append(int_choice)
-        # QKD moves by waveplate angle straight from the enum, not by polarization angle.
-        hwp_angle = basis.angles[int_choice].value
+        # A move to a named polarization goes to its Calibrated angle, which is still a waveplate angle.
+        hwp_angle = settings.polarization_angles.waveplate_angle(basis.angles[int_choice])
         hwp.move_to(hwp_angle)
         logger.debug("Moving half waveplate to angle: %s", hwp_angle)
 
@@ -147,7 +147,7 @@ async def request_qkd_single_pass(state: StateDep) -> bool:
 
     state.qkd_request_basis_list.append(basis_choice)
     state.qkd_request_bit_list.append(int_choice)
-    hwp_angle = basis_choice.angles[int_choice].value
+    hwp_angle = settings.polarization_angles.waveplate_angle(basis_choice.angles[int_choice])
 
     hwp.move_to(hwp_angle)
 

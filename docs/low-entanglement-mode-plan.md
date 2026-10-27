@@ -12,7 +12,7 @@
 | Phase | State | Branch / worktree / PR |
 | --- | --- | --- |
 | 0. Design and workflow | Done (2026-10-27), except installing Node.js for pqn-gui (manual) | `marcosfrenkel/low_entanglement_mode` · `pqn-node/low_entanglement_mode` |
-| 1. Settings and Whobot controls | Not started | `marcosfrenkel/operation_mode_settings` · `pqn-node/operation_mode_settings` |
+| 1. Settings and Whobot controls | Done (2026-10-27) | `marcosfrenkel/operation_mode_settings` · `pqn-node/operation_mode_settings` |
 | 2. Correlation-mode SSM | Not started | `marcosfrenkel/correlation_ssm` · `pqn-node/correlation_ssm` |
 | 3. Unattended SSM and the digest | Not started | `marcosfrenkel/unattended_ssm` · `pqn-node/unattended_ssm` |
 | 4. pqn-gui | Not started | `marcosfrenkel/operation_mode` · `pqn-gui/operation_mode` |
@@ -71,7 +71,14 @@ Shown by pqn-gui only when the Node's Operation mode is `correlation` (decision 
 
 ### Agent decisions (pending review)
 
-None yet.
+| # | Date | Group | Asked by | Question | Decision | Alternatives | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A6 | 2026-10-27 | 1.3 | Phase orchestrator (reviewer-glm finding) | When **Change calibration**'s prefill cannot read the Node, Whobot's framework opens the form on the signature defaults (today's angles, A2's rates). Submitting that form would overwrite a calibrated Node with defaults. Refuse to open the form instead? | Keep the framework's existing behaviour (`Whobot._initial_params`: "a form opening on defaults beats no form", the same for the availability Action). The operator sees every value before submitting, and a Node that cannot be read usually cannot be written either. Changing it is a framework-wide change outside group 1.3 | Refuse to open a prefilled form when its prefill fails (for this Action only, or for all); a warning field in the form | Pending |
+| A5 | 2026-10-27 | 1.2 | Phase orchestrator (Monkey recheck 4) | Monkey mutants that add range checks to `PUT /node/calibration` (no negative VV, no inf/NaN, \|H\| ≤ 360, DD < 10⁹) survive, because nothing pins that such values are accepted. Range-check the Calibrated angles and Reference rates, or pin their acceptance with tests? | Neither: any float is accepted, as decision 16 states ("four angle floats, three rate floats"), and those mutants are dropped. Pinning that nonsense values are accepted would encode no requirement; adding range checks is new behaviour the plan does not ask for. Also dropped: an int D stored as int, and NaN (not valid JSON) stored as 0. Group 1.2 closed after 4 of 5 rounds | Range validation on the request models (a new contract for Marcos to choose); a fifth round of tests pinning acceptance | Pending |
+| A4 | 2026-10-27 | 1.2 | Phase orchestrator (test-reviewer-glm, test-reviewer-qwen, Monkey) | `PUT /node/calibration` reuses the settings models, whose fields have defaults, so a partial body is accepted and silently resets the omitted Calibrated angles or Reference rates to their defaults. Accept partial bodies (merging with the current values) or refuse them? | Refuse: the body must carry all four angles and all three rates; anything missing or non-numeric is a 422 that writes nothing. Decision 16 has **Change calibration** send "four angle floats, three rate floats", so a full body is the contract; refusing is the smaller change and cannot reset a value by accident | Partial update merged with the current values (a PATCH-like contract no caller needs); keeping today's silent reset to defaults | Pending |
+| A3 | 2026-10-27 | 1.1 | Phase orchestrator (test-reviewer-glm finding) | `/chsh/request-angle` receives only a float. Should a custom Angle Sweep pin that equals a named polarization's angle (0, 45, 90, 315) move raw, as decision 6 says for custom angles? | No: a pin at exactly a named angle is that named polarization and moves to its Calibrated angle. A test pins this behaviour. Smallest change: the API and Whobot's payload stay as they are (decision 6; Surgical and minimal) | Adding a "named" flag to `/chsh/request-angle` and to Whobot's sweep payload, so a custom 45° stays raw | Pending |
+| A2 | 2026-10-27 | 1.1 | Coder | The plan gives no default Reference rates for `[correlation_settings]`. What should ship? | `vv = 3000`, `vd = 1500`, `dd = 750` coincidences per second: decision 1's expected levels (VV 1, VD ½, DD ¼) scaled to the whiteboard's ≈3K VV (decision 1, rejected alternative). Nothing reads them until Phase 2, and Phase 5 sets real values with **Change calibration** | All 0.0 as an "operator must set" placeholder (every question would then classify to the same level) | Pending |
+| A1 | 2026-10-27 | 1.1 | Phase orchestrator | `ROSTER.md`'s opencode launch commands (`opencode --agent <id>`) fail: opencode on this machine is now v2.0.32, whose TUI rejects `--agent`. How to start opencode workers? | Launch each opencode worker with `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent <id> --model <roster model>`. Checked that the status bar shows `<id> · <model> via Lumen` and that Orca's `worker-start` accepts it. Same agents, models and `opencode.json` permissions as the roster (Workflow "Roles and loop"; `ROSTER.md` model-id note). `ROSTER.md` is not edited; the overall orchestrator was told | Hard stop until Marcos fixes the roster; per-terminal `OPENCODE_CONFIG_CONTENT` `default_agent` (ignored, the TUI uses a background service); `mini` without `--model` (silently runs "Flint 40B Free") | Pending |
 
 ## Phases
 
@@ -93,32 +100,33 @@ Each pqn-node phase is one PR, stacked on the previous one, in its own Orca work
 No Game behaves differently in this phase.
 
 Node settings:
-- [ ] `OperationMode` `StrEnum` (`entanglement`, `correlation`) in `constants.py`; top-level `operation_mode` setting, default `entanglement` (decision 8)
-- [ ] `[polarization_angles]` with H, V, D, A waveplate angles, defaults equal to `QKDAngleValuesHWP` (decision 5)
-- [ ] Every move to a named polarization uses the Calibrated angles: SSM leader and follower moves, and the Angle Sweep's follower pin when it is H/V/D/A. CHSH, the sweep's leader steps and a custom follower angle stay raw (decision 6)
-- [ ] `[correlation_settings]` with `reference_rates` (VV, VD, DD, coincidences per second) (decision 7)
-- [ ] Update `configs/config_example.toml`
+- [x] `OperationMode` `StrEnum` (`entanglement`, `correlation`) in `constants.py`; top-level `operation_mode` setting, default `entanglement` (decision 8)
+- [x] `[polarization_angles]` with H, V, D, A waveplate angles, defaults equal to `QKDAngleValuesHWP` (decision 5)
+- [x] Every move to a named polarization uses the Calibrated angles: SSM leader and follower moves, and the Angle Sweep's follower pin when it is H/V/D/A. CHSH, the sweep's leader steps and a custom follower angle stay raw (decision 6)
+- [x] `[correlation_settings]` with `reference_rates` (VV, VD, DD, coincidences per second) (decision 7)
+- [x] Update `configs/config_example.toml`
 
 Node API:
-- [ ] `GET`/`PUT /node/operation_mode` and `GET`/`PUT /node/calibration`, writing `config.toml` through `update_config` and applying live (decision 16)
+- [x] `GET`/`PUT /node/operation_mode` and `GET`/`PUT /node/calibration`, writing `config.toml` through `update_config` and applying live (decision 16)
 
 Whobot:
-- [ ] **Change Operation mode** Action (`Scope.ONE`, enum dropdown, prefilled) (decision 16)
-- [ ] **Change calibration** Action (`Scope.ONE`, four angle floats and three rate floats, prefilled) (decision 16)
+- [x] **Change Operation mode** Action (`Scope.ONE`, enum dropdown, prefilled) (decision 16)
+- [x] **Change calibration** Action (`Scope.ONE`, four angle floats and three rate floats, prefilled) (decision 16)
 
 Tests:
-- [ ] Config round-trip: each new key written by `update_config` survives with comments and is applied live
-- [ ] A Node with no new keys behaves exactly as today (angles, mode)
-- [ ] Named moves use the configured angle; continuous moves don't
-- [ ] Both Actions: prefill reads the Node; submit sends the right payload; Node errors become a FAIL report
+- [x] Config round-trip: each new key written by `update_config` survives with comments and is applied live
+- [x] A Node with no new keys behaves exactly as today (angles, mode)
+- [x] Named moves use the configured angle; continuous moves don't
+- [x] Both Actions: prefill reads the Node; submit sends the right payload; Node errors become a FAIL report
 
 ### Phase 2: Correlation-mode SSM (PR 2)
 
 - [ ] In `correlation` mode, the leader and the follower move to V or D (Calibrated angles) by their own Answer, with no random bit (decision 1)
 - [ ] The leader converts each question's count to a rate using the integration time it measured with, and classifies it by the nearest Reference rate: high or low → agree, medium → disagree (decisions 1, 7)
 - [ ] `n_matching_bits` in correlation mode is the number of questions classified as agree; `QKDResult` keeps its shape (decision 17)
+- [ ] In `correlation` mode the leader never fetches the follower's Answers (`/qkd/request_basis_list`): agreement comes only from the Coincidence levels (decisions 1, 3). Test: the follower mock fails the test if that endpoint is called.
 - [ ] Entanglement mode unchanged (decision 4)
-- [ ] Tests: each Answer combination moves the right angles on each side; classification at, between and beyond each reference; a game end to end with a fake time tagger in both modes
+- [ ] Tests: each Answer combination moves the right angles on each side; classification at, between and beyond each reference; a game end to end with a fake time tagger in both modes; the follower's Answers are never fetched in correlation mode
 
 ### Phase 3: Unattended SSM and the digest (PR 3)
 
@@ -218,6 +226,9 @@ Newest first. One row per session or meaningful event.
 
 | Date | Who | What happened |
 | --- | --- | --- |
+| 2026-10-27 | Phase orchestrator | Group 1.3 done: Whobot **Change Operation mode** (`Scope.ONE`, `OperationMode` dropdown) and **Change calibration** (`Scope.ONE`, four angle and three rate floats) Actions, prefilled from the Node, with `NodeClient` methods for `/node/operation_mode` and `/node/calibration`; tests in `test_whobot_flow.py` and `test_whobot_registry.py` (prefill, payload, FAIL on Node errors and wrong-shape answers, reports show the Node's answer, timeouts). Commits `1ffb799`, `5e48a6c`, `b48295d`. 2 fix rounds of 5 (1 review + monkey, 1 monkey); monkey 3 hunts, all real survivors killed. Agent decision A6 (prefill fallback kept). Phase 1's checkbox groups are all done. 426 tests pass, all six checks green |
+| 2026-10-27 | Phase orchestrator | Group 1.2 done: `GET`/`PUT /node/operation_mode` (bare mode string) and `GET`/`PUT /node/calibration` (Calibrated angles + Reference rates; every value required, A4), writing `config.toml` through `update_config` and applying live; endpoint round-trip and refusal tests in `test_node_api_additions.py`. Commits `5aeacaa`, `b17dbb9`, `d98bcd5`, `648784e`, `2619ab9`. 4 fix rounds of 5 (1 review + monkey, 3 monkey); monkey 5 hunts, all real survivors killed; range-check mutants dropped as A5. Agent decisions A4, A5. "Config round-trip" box now done (1.1 + 1.2). Marcos's plan change for Phase 2 committed separately (`088ffd5`). 393 tests pass, all six checks green |
+| 2026-10-27 | Phase orchestrator | Group 1.1 done: `OperationMode` and top-level `operation_mode`, `[polarization_angles]` (Calibrated angles, defaults = `QKDAngleValuesHWP`), `[correlation_settings.reference_rates]`, SSM moves and the Angle Sweep's named follower pin on the Calibrated angles, `config_example.toml`, tests in `test_node_settings.py`. Commits `2903d1b`, `b4cf052`, `12ec01a`. 2 fix rounds (1 review, 1 monkey) of 5; monkey 80 + 20 mutants, survivors M3/M79/M10 killed, the log-line mutant and an equivalent one dropped. Agent decisions A1 (opencode v2 launch command), A2 (default Reference rates), A3 (a custom pin at a named angle is the named pin). The "Config round-trip" box stays `[~]` until 1.2 adds the endpoints. 356 tests pass, all six checks green |
 | 2026-10-27 | Marcos | Phase 0 done. `.agents/` adapted for pqn-node (this plan, six CI checks incl. `uv build`, pqn-node examples, authorship rule, Overall orchestrator rewritten for unattended runs across worktrees) and for pqn-gui (npm checks, no Monkey or test reviewers, plan read and committed in `pqn-node/unattended_ssm`; opencode allows the npm checks). `orchestration/` and `.orca/` git-ignored in both repos. Node.js is not installed on this machine, so pqn-gui's `npm ci` is left as a manual item; the Overall orchestrator checks for it before Phase 4. Phase 1 is next: start the Overall orchestrator in this worktree. |
 | 2026-10-27 | Marcos | Decisions 22 (unattended Overall orchestrator, no review stop between phases) and 23 (authorship) recorded; Phase 0 list updated. |
 | 2026-10-27 | Marcos | Decision 21: testing rule. Summary, Testing rule and Risks written. Design session finished; no open questions. Next: Phase 0 workflow tasks, then commit. |
