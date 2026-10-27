@@ -1,4 +1,4 @@
-"""Tests for the Node API endpoints Whobot drives: node config, availability, screenshot, reboot.
+"""Tests for the Node API endpoints Whobot drives: node config, availability, operation mode, calibration, screenshot, reboot.
 
 The reboot/screenshot tests only pin the *contract* — that reboot answers before
 the machine dies, and that a missing `maim` is a clean error rather than a 500.
@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import tomlkit
 from fastapi.testclient import TestClient
 
 from pqn_node.api import hardware
@@ -20,12 +21,31 @@ from pqn_node.api.deps import get_http_client
 from pqn_node.api.routes import system
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import _last_probe
+from pqn_node.constants import OperationMode
 from pqn_node.core.config import GamesAvailability
+from pqn_node.core.config import PolarizationAngles
+from pqn_node.core.config import ReferenceRates
 from pqn_node.core.config import settings
 from pqn_node.main import app
 
 UP = ComponentStatus(reachable=True)
 DOWN = ComponentStatus(reachable=False, error="unreachable")
+
+COMMENTED_CONFIG = """\
+node_name = "example_node"  # trailing comment
+
+# Router configuration
+router_name = "router1"
+
+[games_availability]
+qf = true  # Quantum Fortune
+"""
+
+# Calibration values unlike any default, so a default that survived can never pass for a written one.
+NEW_CALIBRATION = {
+    "polarization_angles": {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5},
+    "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
+}
 
 
 @pytest.fixture
@@ -36,14 +56,31 @@ def client() -> TestClient:
 
 @pytest.fixture(autouse=True)
 def _isolate_global_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Keep availability writes off the developer's real config.toml and settings."""
+    """Keep availability, mode and calibration writes off the developer's real config.toml and settings."""
     monkeypatch.setattr("pqn_node.core.config.config_path", lambda: tmp_path / "config.toml")
     original_availability = settings.games_availability
+    original_mode = settings.operation_mode
+    original_angles = settings.polarization_angles
+    original_rates = settings.correlation_settings.reference_rates
+    # Copies, so in-place writes land on test objects, never on the real ones.
     settings.games_availability = original_availability.model_copy()
+    settings.polarization_angles = original_angles.model_copy()
+    settings.correlation_settings.reference_rates = original_rates.model_copy()
     original_probe = (_last_probe.ran, _last_probe.router, _last_probe.follower_node)
     yield
     settings.games_availability = original_availability
+    settings.operation_mode = original_mode
+    settings.polarization_angles = original_angles
+    settings.correlation_settings.reference_rates = original_rates
     _last_probe.ran, _last_probe.router, _last_probe.follower_node = original_probe
+
+
+@pytest.fixture
+def commented_config(tmp_path: Path) -> Path:
+    """Create the config.toml these writes land in, carrying the comments an operator wrote."""
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED_CONFIG, encoding="utf-8")
+    return path
 
 
 def test_node_config_reports_the_node_name(client: TestClient) -> None:
@@ -84,6 +121,82 @@ def test_put_availability_cannot_enable_a_game_the_hardware_cannot_run(client: T
     assert response.json() == {"chsh": False, "qf": False, "ssm": False}
     # ...but the configured baseline was still recorded, so games come back with the hardware.
     assert settings.games_availability == GamesAvailability(chsh=True, qf=True, ssm=True)
+
+
+# --------------------------------------------------------------------------------------
+# /node/operation_mode and /node/calibration: settings Whobot can change while the Node runs.
+# --------------------------------------------------------------------------------------
+
+
+def test_get_operation_mode_reports_the_nodes_mode(client: TestClient) -> None:
+    """Decision 8: the API carries the mode's own string, read from the live settings."""
+    response = client.get("/node/operation_mode")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == settings.operation_mode
+
+
+def test_put_operation_mode_persists_and_applies(client: TestClient, commented_config: Path) -> None:
+    response = client.put("/node/operation_mode", json="correlation")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == "correlation"
+    assert settings.operation_mode is OperationMode.CORRELATION
+    written = commented_config.read_text(encoding="utf-8")
+    assert 'operation_mode = "correlation"' in written
+    assert "qf = true  # Quantum Fortune" in written  # the operator's comments survive the write
+
+
+def test_put_operation_mode_is_visible_to_get_without_a_restart(client: TestClient) -> None:
+    client.put("/node/operation_mode", json="correlation")
+
+    assert client.get("/node/operation_mode").json() == "correlation"
+
+
+def test_put_operation_mode_refuses_a_mode_the_node_does_not_know(client: TestClient) -> None:
+    """Decision 8: only "entanglement" and "correlation" are Operation modes, so nothing else is written."""
+    before = settings.operation_mode
+
+    response = client.put("/node/operation_mode", json="quantum")
+
+    assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert settings.operation_mode is before
+
+
+def test_get_calibration_reports_the_nodes_calibration(client: TestClient) -> None:
+    response = client.get("/node/calibration")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {
+        "polarization_angles": settings.polarization_angles.model_dump(),
+        "reference_rates": settings.correlation_settings.reference_rates.model_dump(),
+    }
+
+
+def test_put_calibration_persists_and_applies(client: TestClient, commented_config: Path) -> None:
+    held_angles = settings.polarization_angles
+    held_rates = settings.correlation_settings.reference_rates
+
+    response = client.put("/node/calibration", json=NEW_CALIBRATION)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == NEW_CALIBRATION
+    # Applied live, in place: the settings object every module holds already carries the new values.
+    assert settings.polarization_angles is held_angles
+    assert held_angles == PolarizationAngles(h=1.5, v=2.5, d=3.5, a=4.5)
+    assert settings.correlation_settings.reference_rates is held_rates
+    assert held_rates == ReferenceRates(vv=11.0, vd=12.0, dd=13.0)
+    written = commented_config.read_text(encoding="utf-8")
+    assert "qf = true  # Quantum Fortune" in written  # the operator's comments survive the write
+    document = tomlkit.parse(written)
+    assert dict(document["polarization_angles"]) == NEW_CALIBRATION["polarization_angles"]
+    assert dict(document["correlation_settings"]["reference_rates"]) == NEW_CALIBRATION["reference_rates"]
+
+
+def test_put_calibration_is_visible_to_get_without_a_restart(client: TestClient) -> None:
+    client.put("/node/calibration", json=NEW_CALIBRATION)
+
+    assert client.get("/node/calibration").json() == NEW_CALIBRATION
 
 
 def test_screenshot_returns_the_png_bytes(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
