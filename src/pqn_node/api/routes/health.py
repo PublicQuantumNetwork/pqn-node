@@ -29,6 +29,9 @@ _SERIAL_WALL_TIMEOUT_S = 3.0
 _FOLLOWER_TIMEOUT_S = 5.0
 _FOLLOWER_WALL_TIMEOUT_S = 6.0
 
+_GUI_TIMEOUT_S = 5.0
+_GUI_WALL_TIMEOUT_S = 6.0
+
 _probe_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
 
 
@@ -54,6 +57,10 @@ class HealthStatus(BaseModel):
     devices: list[DeviceStatus] = Field(default_factory=list)
     rotary_encoder: ComponentStatus | None = None
     follower_node: ComponentStatus | None = None
+    # Deliberately not an input to `all_ok` or the availability gate: a dead GUI
+    # leaves the API and hardware working, so the games (and Whobot's measurements
+    # of them) must keep running. Whobot reports it on its own. None means not probed.
+    gui: ComponentStatus | None = None
 
     @property
     def all_ok(self) -> bool:
@@ -190,21 +197,41 @@ def _probe_rotary_encoder() -> ComponentStatus | None:
     return ComponentStatus(reachable=True, latency_ms=_elapsed_ms(start))
 
 
-def _probe_follower(follower_node_address: str) -> ComponentStatus:
+def _probe_http(address: str, timeout_s: float) -> ComponentStatus:
+    """GET `http://{address}/`; any non-2xx or transport failure counts as unreachable."""
     start = time.perf_counter()
     try:
-        with httpx.Client(timeout=_FOLLOWER_TIMEOUT_S) as http:
-            response = http.get(f"http://{follower_node_address}/")
+        with httpx.Client(timeout=timeout_s) as http:
+            response = http.get(f"http://{address}/")
         response.raise_for_status()
     except Exception as e:  # noqa: BLE001 - any failure must surface, not crash the endpoint
         return ComponentStatus(reachable=False, error=_format_error(e))
     return ComponentStatus(reachable=True, latency_ms=_elapsed_ms(start))
 
 
+def _probe_follower(follower_node_address: str) -> ComponentStatus:
+    return _probe_http(follower_node_address, _FOLLOWER_TIMEOUT_S)
+
+
+def _probe_gui(gui_address: str) -> ComponentStatus:
+    return _probe_http(gui_address, _GUI_TIMEOUT_S)
+
+
+def _probe_optional(
+    address: str | None, probe: Callable[[str], ComponentStatus], wall_timeout_s: float
+) -> ComponentStatus | None:
+    """Run `probe` on `address` under a wall timeout; None when no address is configured."""
+    if not address:
+        return None
+    try:
+        return _run_with_timeout(lambda: probe(address), wall_timeout_s)
+    except concurrent.futures.TimeoutError:
+        return ComponentStatus(reachable=False, error="timeout")
+
+
 @router.get("/")
 def health() -> HealthStatus:
-    """Probe router, configured devices, rotary encoder, and optional follower node."""
-    follower_node_address = settings.follower_node_address
+    """Probe router, configured devices, rotary encoder, optional follower node, and the GUI."""
     try:
         router_status, client = _run_with_timeout(_connect_router, _ROUTER_WALL_TIMEOUT_S)
     except concurrent.futures.TimeoutError:
@@ -235,13 +262,8 @@ def health() -> HealthStatus:
     else:
         rotary_encoder = _probe_rotary_encoder()
 
-    if follower_node_address:
-        try:
-            follower_node = _run_with_timeout(lambda: _probe_follower(follower_node_address), _FOLLOWER_WALL_TIMEOUT_S)
-        except concurrent.futures.TimeoutError:
-            follower_node = ComponentStatus(reachable=False, error="timeout")
-    else:
-        follower_node = None
+    follower_node = _probe_optional(settings.follower_node_address, _probe_follower, _FOLLOWER_WALL_TIMEOUT_S)
+    gui = _probe_optional(settings.gui_address, _probe_gui, _GUI_WALL_TIMEOUT_S)
 
     # Record the gate's inputs, not its result: /games/availability recomputes from
     # the pristine config on every read, so games recover once hardware comes back.
@@ -254,6 +276,7 @@ def health() -> HealthStatus:
         devices=devices,
         rotary_encoder=rotary_encoder,
         follower_node=follower_node,
+        gui=gui,
     )
 
 

@@ -11,6 +11,11 @@ router_port = 5555
 # The health check probes this address on startup and disables CHSH/SSM if unreachable.
 follower_node_address = "xx.xx.xx.xx:8000"  # Replace with actual follower node address
 
+# Address of this Node's own GUI (pqn-gui). The health check probes it and reports it
+# to Whobot; a dead GUI does not disable any games. Defaults to "localhost:3000".
+# Set to "" to opt out, and the GUI is not probed.
+gui_address = "localhost:3000"
+
 # Rotary encoder serial adress
 rotary_encoder_address = "/dev/tty.usbmodem1101"
 
