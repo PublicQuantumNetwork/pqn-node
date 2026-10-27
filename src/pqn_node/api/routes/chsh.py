@@ -19,6 +19,7 @@ from pqn_node.api.hardware import move_to_polarization
 from pqn_node.api.peers import fetch_node_name
 from pqn_node.api.peers import measure_coincidences
 from pqn_node.api.peers import require_follower_address
+from pqn_node.constants import QKDAngleValuesHWP
 from pqn_node.core.config import chsh_progress_event
 from pqn_node.core.config import settings
 
@@ -223,8 +224,19 @@ async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = Fa
 
 @router.post("/request-angle")
 async def request_angle(angle: float) -> bool:
-    """Move the requested waveplate to a free polarization angle, rather than one of the basis angles."""
-    return _move_request_hwp(angle)
+    """Move the requested waveplate to a free polarization angle, rather than one of the basis angles.
+
+    H, V, D and A — what an Angle Sweep pins the follower at — move to their Calibrated angles;
+    a custom angle keeps moving raw, at half the polarization angle.
+    """
+    hwp = find_rotator(settings.chsh_settings.request_hwp)
+    named = QKDAngleValuesHWP.from_polarization_angle(angle)
+    if named is None:
+        move_to_polarization(hwp, angle)
+    else:
+        hwp.move_to(settings.polarization_angles.waveplate_angle(named))
+    logger.info("moving waveplate", extra={"angle": angle})
+    return True
 
 
 @router.post("/sweep")

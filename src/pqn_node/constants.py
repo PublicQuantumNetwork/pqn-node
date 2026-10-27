@@ -2,6 +2,16 @@ from enum import Enum
 from enum import StrEnum
 
 
+class OperationMode(StrEnum):
+    """How a Node plays its two-player Games: on entangled pairs, or only on polarization-correlated ones.
+
+    ``entanglement`` is today's behaviour and the default; ``correlation`` is for when entanglement is low.
+    """
+
+    ENTANGLEMENT = "entanglement"
+    CORRELATION = "correlation"
+
+
 class QKDAngleValuesHWP(Enum):
     """The half waveplate angles that set H, V, D and A. Waveplate angles, not polarization angles."""
 
@@ -14,6 +24,18 @@ class QKDAngleValuesHWP(Enum):
     def polarization(self) -> float:
         """The polarization angle this waveplate angle sets, on the 0-360° axis."""
         return float(2 * self.value) % 360.0
+
+    @classmethod
+    def from_polarization_angle(cls, polarization_angle: float) -> "QKDAngleValuesHWP | None":
+        """Return the named polarization at this polarization angle, or None when none of the four sits there.
+
+        The inverse of ``polarization``: an Angle Sweep pins the follower at a polarization angle,
+        and only the four named ones carry a Calibrated angle.
+        """
+        for member in cls:
+            if member.polarization == polarization_angle:
+                return member
+        return None
 
 
 class Polarization(StrEnum):

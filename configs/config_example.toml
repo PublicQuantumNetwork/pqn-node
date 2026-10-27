@@ -20,6 +20,10 @@ timetagger = ["provider", "tagger"] # Replace with actual provider and instrumen
 # Bell state configuration (default: Phi_plus)
 bell_state = 0
 
+# How this Node plays its two-player games: "entanglement" (entangled pairs, today's behaviour)
+# or "correlation" (polarization-correlated pairs, for when entanglement is low)
+operation_mode = "entanglement"
+
 # CHSH experiment settings
 [chsh_settings]
 hwp = ["provider", "instrument_hwp"]  # Replace with actual HWP names
@@ -53,3 +57,20 @@ dark_count = 0
 [rng_settings]
 channels = [1, 2]   # Timetagger channels to sample for singles parity
 fortune_size = 8    # Number of parity measurements per fortune run
+
+# The Calibrated angles: the waveplate angles this Node moves to for H, V, D and A.
+# Defaults are today's values; set the real ones once the Node is aligned.
+[polarization_angles]
+h = 0.0
+v = 45.0
+d = 22.5
+a = -22.5
+
+# Settings for the correlation Operation mode
+[correlation_settings]
+# The Reference rates: expected coincidences per second for each pair of Answers, used only
+# when this Node leads. Defaults assume a product-VV source at ~3000 coincidences/s.
+[correlation_settings.reference_rates]
+vv = 3000.0
+vd = 1500.0
+dd = 750.0
