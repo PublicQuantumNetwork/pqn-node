@@ -96,6 +96,10 @@ from pqn_node.api.main import StatedPolarizationAngles
 from pqn_node.api.main import StatedReferenceRates
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.api.routes.qkd import UnattendedCorrelationResult
+from pqn_node.api.routes.qkd import UnattendedEntanglementResult
+from pqn_node.api.routes.qkd import UnattendedQKDAnswers
+from pqn_node.constants import CoincidenceLevel
 from pqn_node.constants import OperationMode
 from pqn_node.constants import Polarization
 from pqn_node.core.config import GamesAvailability
@@ -116,12 +120,15 @@ from pqn_whobot.actions import action
 from pqn_whobot.actions import prefill
 from pqn_whobot.actions import scan_actions
 from pqn_whobot.config import DEFAULT_BASIS
+from pqn_whobot.config import DEFAULT_SSM_MAX_ERROR_RATE
+from pqn_whobot.config import DEFAULT_SSM_QUESTIONS
 from pqn_whobot.config import ConfigWriteError
 from pqn_whobot.config import WhobotSettings
 from pqn_whobot.config import config_path
 from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeApiError
 from pqn_whobot.node_client import NodeClient
+from pqn_whobot.node_client import UnattendedSsmResult
 from pqn_whobot.registry import UNKNOWN_NAME
 from pqn_whobot.registry import Node
 from pqn_whobot.registry import resolve_nodes
@@ -161,6 +168,17 @@ def one_game_budget(settings: WhobotSettings) -> float:
     return settings.node_timeout_s + settings.per_game_timeout_s
 
 
+def ssm_budget(settings: WhobotSettings) -> float:
+    """How long Run SSM may take: the Game plus the two Node reads around it.
+
+    More than ``one_game_budget`` because, unlike Run CHSH, it reads the Node's Operation mode
+    and — in correlation mode — its Reference rates as well as playing the game, and the report
+    must not be thrown away as "Timed out" after the game has already run. The sum is what it
+    spends: two node calls and one Game.
+    """
+    return 2 * settings.node_timeout_s + settings.per_game_timeout_s
+
+
 def sweep_csv_path() -> Path:
     """Where every Angle Sweep's data is kept: beside ``whobot.toml``, untracked like it."""
     return config_path().parent / "whobot_sweeps.csv"
@@ -185,14 +203,18 @@ def whole_digest_budget(settings: WhobotSettings) -> float:
 
 
 def one_node_budget(settings: WhobotSettings) -> float:
-    """How long checking one Node over may take: two Node calls, then both Games it may play.
+    """How long checking one Node over may take: its Node calls, then the Games it may play.
 
     Derived rather than configured. A ``per_node_timeout_s`` key would be a second statement of
     the same thing, free to disagree with it — and it did: the default was 900s while two Games
     at 600s each need 1200s, so a Node whose Games were merely slow lost both measurements to a
     budget nobody had chosen.
+
+    The calls are the hardware probe and the Game availability read; the Node's Operation mode,
+    its follower address and that follower's mode; and the Reference rates a correlation-mode SSM
+    report shows beside each measured one. The Games are CHSH, Quantum Fortune and SSM.
     """
-    return 2 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
+    return 6 * settings.node_timeout_s + 3 * settings.per_game_timeout_s
 
 
 SCHEDULE_BOUNDS = {"hour": (0, 23), "minute": (0, 59)}
@@ -201,6 +223,9 @@ and ``test_the_schedule_action_refuses_what_the_config_would`` keeps the two in 
 
 DIGEST_TITLE = "Daily Digest"
 """What the fleet-wide report is called, whether it was scheduled or asked for by hand."""
+
+OPERATION_MODE_LABEL = "Operation mode"
+"""The digest section that states a Node's Operation mode and whether its follower agrees."""
 
 BELL_CLASSICAL_LIMIT = 2.0
 """An S above this is the Bell inequality being violated, which is the point of the exercise."""
@@ -509,6 +534,55 @@ class Whobot(ABC):
         """Open the form on the angles an unattended run would use, so config is the starting point."""
         angle_a, angle_b = self.settings.basis
         return {"angle_a": angle_a, "angle_b": angle_b}
+
+    @action(
+        label="Run SSM",
+        description="Play one unattended Share a Secret Message game on a Node, with both players' Answers.",
+        scope=Scope.ONE,
+        timeout_s=ssm_budget,
+    )
+    async def run_ssm(  # noqa: PLR0913 - the form asks one field per default an operator may override (decision 14)
+        self,
+        node: Node,
+        *,
+        questions: int = DEFAULT_SSM_QUESTIONS,
+        leader_answers: str = "",
+        follower_answers: str = "",
+        max_error_rate: float = DEFAULT_SSM_MAX_ERROR_RATE,
+        integration_time_s: float = 0.0,
+    ) -> Report:
+        """Play one unattended SSM game on this Node as leader, and report how it went.
+
+        Every default is a form field prefilled from config and the Node's Operation mode
+        (decision 14): the two players' Answers as strings of ``a`` (left) and ``b`` (right),
+        left empty to mean the mode's own pattern for ``questions`` questions. Only the leader
+        is picked; its configured follower plays the other side (decision 15).
+        """
+        section = await self._play_ssm(
+            node, questions, leader_answers, follower_answers, max_error_rate, integration_time_s
+        )
+        return Report(
+            status=section.status or Status.OK, title=f"{GAME_TITLES['ssm']} — {node.name}", sections=[section]
+        )
+
+    @prefill(run_ssm)
+    async def _ssm_answers_prefill(self, node: Node) -> dict[str, object]:
+        """Open the form on the Answers an unattended run would use for this Node's mode (decision 13).
+
+        The mode decides the pattern: entanglement plays every question with matching Answers,
+        correlation cycles the four Answer combinations. Reading it can fail; the framework
+        then opens the form on the signature's defaults, which an operator can fill in.
+        """
+        mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+        questions = self.settings.ssm_questions
+        leader, follower = _ssm_default_answers(mode, questions)
+        return {
+            "questions": questions,
+            "leader_answers": leader,
+            "follower_answers": follower,
+            "max_error_rate": self.settings.ssm_max_error_rate,
+            "integration_time_s": 0.0,
+        }
 
     @action(
         label="Angle Sweep",
@@ -1151,7 +1225,9 @@ class Whobot(ABC):
         except NodeApiError as e:
             sections = [_failed_section("Hardware", "The hardware probe failed.", str(e))]
 
-        sections += await self._play_games(node)
+        mode_section, mode = await self._operation_mode_section(node)
+        sections.append(mode_section)
+        sections += await self._play_games(node, mode)
 
         return NodeDigest(
             name=node.name,
@@ -1160,12 +1236,72 @@ class Whobot(ABC):
             sections=sections,
         )
 
-    async def _play_games(self, node: Node) -> list[Section]:
+    async def _operation_mode_section(self, node: Node) -> tuple[Section, OperationMode | None]:
+        """State this Node's Operation mode and whether its follower agrees (decision 9).
+
+        The mode is a Node-level fact — it changes what the GUI tells CHSH players too — so it is
+        reported for every reachable Node whether or not SSM is offered, and the read is handed
+        back so the SSM section need not ask again. A mismatch is an operator mistake, never
+        coordinated away (decision 9), so it is flagged rather than corrected.
+        """
+        try:
+            mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+        except NodeApiError as e:
+            # The SSM section reads the mode itself and reports its own failure as 3.2 does.
+            return (
+                Section(
+                    label=OPERATION_MODE_LABEL,
+                    status=Status.WARN,
+                    fields=[Field(name="Operation mode", value="unknown", status=Status.WARN)],
+                    error=str(e),
+                ),
+                None,
+            )
+
+        follower = await self._follower_mode_field(node, mode)
+        fields = [Field(name="Operation mode", value=mode.value, status=Status.OK), follower]
+        return Section(label=OPERATION_MODE_LABEL, status=Status.overall(f.status for f in fields), fields=fields), mode
+
+    async def _follower_mode_field(self, node: Node, mode: OperationMode) -> Field:
+        """Flag the follower when it plays in a different mode, per A13.
+
+        The follower is the address this Node itself uses for one (decision 15): read it from
+        ``/node/config`` and ask that address directly. A follower's mode that cannot be read is
+        reported as unknown and WARNs, so a mismatch is never hidden behind a failure.
+        """
+        try:
+            config = await self._client(node).get_config(self.settings.node_timeout_s)
+        except NodeApiError as e:
+            return Field(
+                name="Follower mode", value=f"unknown, could not read this Node's config: {e}", status=Status.WARN
+            )
+
+        address = config.follower_node_address
+        if not address:
+            return Field(name="Follower mode", value="none configured", status=Status.OK)
+
+        try:
+            follower_mode = await self._client(Node(api_url=f"http://{address}", reachable=True)).get_operation_mode(
+                self.settings.node_timeout_s
+            )
+        except NodeApiError as e:
+            return Field(name="Follower mode", value=f"unknown at {address}: {e}", status=Status.WARN)
+
+        if follower_mode is mode:
+            return Field(name="Follower mode", value=follower_mode.value, status=Status.OK)
+        return Field(
+            name="Follower mode",
+            value=f"{follower_mode.value} at {address}, but this Node plays in {mode.value} mode",
+            status=Status.WARN,
+        )
+
+    async def _play_games(self, node: Node, mode: OperationMode | None) -> list[Section]:
         """Ask the Node which Games it offers, and play the ones it does.
 
         Availability that cannot be read skips every Game rather than assuming all of them are
         on. Whether a Game may run is the *Node's* answer to give: assuming is how an unattended
-        run plays a Game an operator deliberately switched off.
+        run plays a Game an operator deliberately switched off. ``mode`` is the Operation mode
+        already read for the digest (decision 13); ``None`` makes the SSM section read it itself.
         """
         try:
             availability = await self._client(node).get_availability(self.settings.node_timeout_s)
@@ -1184,12 +1320,22 @@ class Whobot(ABC):
         else:
             sections.append(_skipped_section(GAME_TITLES["qf"], "Not available on this Node."))
 
-        # SSM is never played, whether it is available or not — hence no branch on availability.
-        sections.append(
-            _skipped_section(
-                GAME_TITLES["ssm"], "Needs an interactive coordination dance, so an unattended run cannot play it."
+        if availability.ssm:
+            # The Node plays SSM with the digest's own Answers: empty fields take the mode's
+            # default pattern for this many questions, and no integration time is sent (A9).
+            sections.append(
+                await self._play_ssm(
+                    node,
+                    self.settings.ssm_questions,
+                    "",
+                    "",
+                    self.settings.ssm_max_error_rate,
+                    0.0,
+                    mode=mode,
+                )
             )
-        )
+        else:
+            sections.append(_skipped_section(GAME_TITLES["ssm"], "Not available on this Node."))
         return sections
 
     async def _play_chsh(self, node: Node, basis: tuple[float, float]) -> Section:
@@ -1237,6 +1383,76 @@ class Whobot(ABC):
             fields=[Field(name="Fortune per channel", value=", ".join(str(number) for number in drawn) or "nothing")],
             note=f"{time.monotonic() - started:.1f}s",
         )
+
+    async def _play_ssm(  # noqa: PLR0913 - the game takes both players' Answers and every default
+        self,
+        node: Node,
+        questions: int,
+        leader_answers: str,
+        follower_answers: str,
+        max_error_rate: float,
+        integration_time_s: float,
+        mode: OperationMode | None = None,
+    ) -> Section:
+        """Play one unattended SSM game and describe how it went, or why it could not.
+
+        Shared by Run SSM and the digest (decision 13): the leader runs the game, and the
+        section states the mode and either the per-basis error rate (entanglement) or each
+        question's measured rate beside its Reference rate and expected level (correlation).
+        Empty Answer fields mean the mode's own pattern for ``questions`` questions, so the
+        digest — which picks no Answers — need not know them; ``mode`` lets a caller that has
+        already read the Node skip reading it again.
+        """
+        label = GAME_TITLES["ssm"]
+        started = time.monotonic()
+        leader, follower = leader_answers.strip().lower(), follower_answers.strip().lower()
+
+        # The mode is read once up front, because every section states it and the default
+        # Answers need it (decision 13). A Node that will not answer leaves the mode unknown:
+        # the failure is the report's if there were no Answers to play with, and otherwise the
+        # game still runs, since the Node decides the mode it actually plays in.
+        mode_error: NodeApiError | None = None
+        if mode is None:
+            try:
+                mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+            except NodeApiError as e:
+                mode_error = e
+
+        if not leader and not follower:
+            if mode is None:
+                return _failed_section(
+                    label, "The Game did not complete.", str(mode_error), time.monotonic() - started, "unknown"
+                )
+            leader, follower = _ssm_default_answers(mode, questions)
+        elif mode is None:
+            # There are Answers to play, so an unreadable mode only leaves the report's own
+            # mode row unknown; the Node still decides the mode the game actually plays in.
+            logger.warning("%s: could not read the Operation mode for the SSM report: %s", node.name, mode_error)
+
+        problem = _ssm_answers_problem(questions, leader, follower)
+        if problem is not None:
+            return _refused_section(label, problem, _ssm_mode_value(mode))
+
+        try:
+            result = await self._client(node).run_ssm(
+                UnattendedQKDAnswers(leader_answers=list(leader), follower_answers=list(follower)),
+                self.settings.timetagger_address,
+                self.settings.per_game_timeout_s,
+                None if integration_time_s <= 0 else integration_time_s,
+            )
+        except NodeApiError as e:
+            return _failed_section(
+                label, "The Game did not complete.", str(e), time.monotonic() - started, _ssm_mode_value(mode)
+            )
+
+        references = None
+        if result.mode is OperationMode.CORRELATION:
+            try:
+                references = (await self._client(node).get_calibration(self.settings.node_timeout_s)).reference_rates
+            except NodeApiError as e:
+                logger.warning("%s: read the SSM game but not this Node's Reference rates: %s", node.name, e)
+
+        return _ssm_section(result, leader, follower, max_error_rate, references, time.monotonic() - started)
 
     async def _initial_params(self, act: Action, node: Node | None) -> dict[str, object]:
         """Work out what a parameter form should open on.
@@ -1325,12 +1541,22 @@ def _hardware_section(health: HealthStatus) -> Section:
     return Section(label="Hardware", status=Status.overall(f.status for f in fields), fields=fields)
 
 
-def _failed_section(label: str, summary: str, error: str, elapsed_s: float | None = None) -> Section:
-    """Describe something that was attempted and did not work."""
+def _failed_section(
+    label: str, summary: str, error: str, elapsed_s: float | None = None, mode_value: str | None = None
+) -> Section:
+    """Describe something that was attempted and did not work.
+
+    ``mode_value`` prepends the Operation mode row an SSM section must carry even when it fails
+    (decision 13); it is ``None`` for every caller that is not SSM, and "unknown" when the Node
+    could not be asked.
+    """
+    fields = [Field(name="Result", value=summary, status=Status.FAIL)]
+    if mode_value is not None:
+        fields.insert(0, Field(name="Operation mode", value=mode_value))
     return Section(
         label=label,
         status=Status.FAIL,
-        fields=[Field(name="Result", value=summary, status=Status.FAIL)],
+        fields=fields,
         note=None if elapsed_s is None else f"{elapsed_s:.1f}s",
         error=error,
     )
@@ -1359,3 +1585,189 @@ def _skipped_section(label: str, reason: str) -> Section:
     wrong.
     """
     return Section(label=label, status=Status.SKIPPED, fields=[Field(name="Skipped", value=reason)])
+
+
+def _refused_section(label: str, reason: str, mode_value: str | None = None) -> Section:
+    """Describe an Action that refused its input before touching a Node.
+
+    A game that never started is a ``FAIL``: the operator asked for something that could not
+    happen, and no measurement came back to soften it. ``mode_value`` is as in
+    ``_failed_section``: SSM states its Operation mode on every section (decision 13).
+    """
+    fields = [Field(name="Answers", value=reason, status=Status.FAIL)]
+    if mode_value is not None:
+        fields.insert(0, Field(name="Operation mode", value=mode_value))
+    return Section(label=label, status=Status.FAIL, fields=fields)
+
+
+def _ssm_mode_value(mode: OperationMode | None) -> str:
+    """Render the Operation mode row's value, saying "unknown" when the Node could not be asked."""
+    return mode.value if mode is not None else "unknown"
+
+
+LEFT = "a"
+"""The Answer that picks left — the H/V basis, or V in correlation mode."""
+
+RIGHT = "b"
+"""The Answer that picks right — the D/A basis, or D in correlation mode."""
+
+CORRELATION_CYCLE = 4
+"""How many questions the four Answer combinations take to repeat (decision 1)."""
+
+CORRELATION_LEFT_RUN = 2
+"""How many of those four combinations a player answers left in (left/left, left/right)."""
+
+
+def _ssm_default_answers(mode: OperationMode, questions: int) -> tuple[str, str]:
+    """Return the Answers an unattended SSM run uses when no operator picks them (decision 13).
+
+    Entanglement plays every question with matching Answers, the first half both left and the
+    rest both right, so each basis gets some of them. Correlation cycles the four Answer
+    combinations — left/left, left/right, right/left, right/right — so every expected
+    Coincidence level is exercised and each should appear in turn.
+    """
+    if mode is OperationMode.CORRELATION:
+        leader = "".join(
+            LEFT if index % CORRELATION_CYCLE < CORRELATION_LEFT_RUN else RIGHT for index in range(questions)
+        )
+        follower = "".join(LEFT if index % CORRELATION_LEFT_RUN == 0 else RIGHT for index in range(questions))
+        return leader, follower
+    left_count = (questions + 1) // 2
+    answers = LEFT * left_count + RIGHT * (questions - left_count)
+    return answers, answers
+
+
+def _ssm_answers_problem(questions: int, leader: str, follower: str) -> str | None:
+    """Name the first thing wrong with a pair of Answer strings, or ``None`` if both are usable.
+
+    The two must be the same length (decision 14), that length must be the number of questions
+    the game is for, and every character must be an Answer. Checked here so a typo is a clear
+    refusal rather than a Node call that fails somewhere else.
+    """
+    if len(leader) != len(follower):
+        return f"the two players' Answers must be the same length, not {len(leader)} and {len(follower)}"
+    if len(leader) != questions:
+        return f"{len(leader)} Answers do not match {questions} questions"
+    for who, answers in (("leader", leader), ("follower", follower)):
+        wrong = next((answer for answer in answers if answer not in (LEFT, RIGHT)), None)
+        if wrong is not None:
+            return f"the {who}'s Answers must be a and b, not {wrong!r}"
+    return None
+
+
+def _ssm_basis(answer: str) -> str:
+    """Name the basis an Answer picks, as the report shows it."""
+    return "H/V" if answer == LEFT else "D/A"
+
+
+def _ssm_expected_level(leader: str, follower: str) -> CoincidenceLevel:
+    """Return the Coincidence level the two Answers should give, from their own waveplates (decision 1).
+
+    Left moves to V and right to D, so both-left is VV (high), both-right is DD (low), and a
+    mixed pair is VD or DV (medium).
+    """
+    if leader == LEFT and follower == LEFT:
+        return CoincidenceLevel.HIGH
+    if leader == RIGHT and follower == RIGHT:
+        return CoincidenceLevel.LOW
+    return CoincidenceLevel.MEDIUM
+
+
+def _ssm_reference_rate(references: ReferenceRates, level: CoincidenceLevel) -> float:
+    """Return the Reference rate a Coincidence level is measured against (decision 7)."""
+    return {
+        CoincidenceLevel.HIGH: references.vv,
+        CoincidenceLevel.MEDIUM: references.vd,
+        CoincidenceLevel.LOW: references.dd,
+    }[level]
+
+
+def _ssm_section(  # noqa: PLR0913 - it takes the game's result, the Answers, and what to check against
+    result: UnattendedSsmResult,
+    leader: str,
+    follower: str,
+    max_error_rate: float,
+    references: ReferenceRates | None,
+    elapsed_s: float,
+) -> Section:
+    """Describe one unattended SSM game as the section the Action and the digest share (decision 13).
+
+    The mode is always stated. Entanglement reports a bit error rate per basis, OK when each is
+    at or under ``max_error_rate`` and WARN otherwise — a basis no question compared is not
+    under anything, so it WARNs too. Correlation shows each question's measured rate beside the
+    Reference rate of the level the two Answers expect, OK when the measured level is that
+    level and WARN otherwise.
+    """
+    if isinstance(result, UnattendedCorrelationResult):
+        return _ssm_correlation_section(result, leader, follower, references, elapsed_s)
+    return _ssm_entanglement_section(result, leader, follower, max_error_rate, elapsed_s)
+
+
+def _ssm_entanglement_section(
+    result: UnattendedEntanglementResult, leader: str, follower: str, max_error_rate: float, elapsed_s: float
+) -> Section:
+    """Build the entanglement-mode SSM section: the bit error rate on each basis (decision 13)."""
+    fields = [Field(name="Operation mode", value=OperationMode.ENTANGLEMENT.value)]
+    for answer in (LEFT, RIGHT):
+        # Only the questions whose two Answers matched had agreeing bases, so only those
+        # compare; the Node returns a bit for every question and Whobot filters with its own.
+        wanted = [index for index in range(len(leader)) if leader[index] == follower[index] == answer]
+        if not wanted:
+            fields.append(Field(name=f"{_ssm_basis(answer)} error rate", value="not compared", status=Status.WARN))
+            continue
+        errors = sum(1 for index in wanted if result.leader_bits[index] != result.follower_bits[index])
+        rate = errors / len(wanted)
+        status = Status.OK if rate <= max_error_rate else Status.WARN
+        fields.append(
+            Field(
+                name=f"{_ssm_basis(answer)} error rate",
+                value=f"{rate:.4f} ({errors} of {len(wanted)} bits mismatched)",
+                status=status,
+            )
+        )
+
+    # Kept so a reader knows what "OK" was measured against.
+    fields.append(Field(name="Max error rate", value=f"{max_error_rate:g}"))
+    return Section(
+        label=GAME_TITLES["ssm"],
+        status=Status.overall(field.status for field in fields),
+        fields=fields,
+        note=f"{elapsed_s:.1f}s",
+    )
+
+
+def _ssm_correlation_section(
+    result: UnattendedCorrelationResult,
+    leader: str,
+    follower: str,
+    references: ReferenceRates | None,
+    elapsed_s: float,
+) -> Section:
+    """Build the correlation-mode SSM section: each measured rate beside its Reference rate.
+
+    Decision 13: each measured rate is shown next to its Reference rate, and a question whose
+    Coincidence level is not the one its two Answers expect makes the whole check a WARN.
+    """
+    fields = [Field(name="Operation mode", value=OperationMode.CORRELATION.value)]
+    for index, (ours, theirs) in enumerate(zip(leader, follower, strict=False)):
+        expected = _ssm_expected_level(ours, theirs)
+        measured = result.levels[index]
+        rate = result.rates[index]
+        # Decision 13: OK when every question gets its expected Coincidence level, WARN
+        # otherwise. That is the level comparison alone; the Reference rate is shown beside the
+        # measured one, and its absence is reported in the value rather than changing the verdict.
+        if references is None:
+            reference = "reference unknown"
+        else:
+            reference = f"reference {_ssm_reference_rate(references, expected):g}"
+        value = f"{rate:g} cps, {reference}, measured {measured.value}, expected {expected.value}"
+        fields.append(
+            Field(name=f"Q{index + 1}", value=value, status=Status.OK if measured is expected else Status.WARN)
+        )
+
+    return Section(
+        label=GAME_TITLES["ssm"],
+        status=Status.overall(field.status for field in fields),
+        fields=fields,
+        note=f"{elapsed_s:.1f}s",
+    )

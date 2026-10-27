@@ -71,6 +71,9 @@ fit comfortably; ten do not."""
 NUMBER_TYPES: tuple[type, ...] = (float, int)
 """Parameter types rendered as a number input. An ``int`` disallows decimals; a ``float`` allows them."""
 
+TEXT_TYPES: tuple[type, ...] = (str,)
+"""Parameter types rendered as a single-line text field, for free text such as a string of Answers."""
+
 IMAGE_SUFFIXES = ((b"\x89PNG\r\n\x1a\n", "png"), (b"GIF8", "gif"), (b"\xff\xd8\xff", "jpg"))
 """Magic numbers, so an upload can be named after what it actually is.
 
@@ -280,8 +283,9 @@ class WhobotSlack(Whobot):
         takes its default in ``coerce_params``, and switches the flag back *on*.
 
         A number input needs no floor: an empty one is genuinely "no answer", and leaving it out
-        lets ``coerce_params`` supply the default. A dropdown always has a pick, since it opens
-        on one, and reports it as ``selected_option``.
+        lets ``coerce_params`` supply the default. A text field is the same: an empty one is no
+        answer rather than the empty string. A dropdown always has a pick, since it opens on one,
+        and reports it as ``selected_option``.
         """
         params: dict[str, object] = {
             parameter.name: False for parameter in act.parameters if parameter.annotation is bool
@@ -296,7 +300,7 @@ class WhobotSlack(Whobot):
                 picked = (element.get("selected_option") or {}).get("value")
                 if picked:
                     params[parameter.name] = picked
-            elif parameter.annotation in NUMBER_TYPES:
+            elif parameter.annotation in NUMBER_TYPES or parameter.annotation in TEXT_TYPES:
                 typed = element.get("value")
                 if typed:
                     params[parameter.name] = typed
@@ -407,16 +411,18 @@ class WhobotSlack(Whobot):
         """Generate the whole form from the Action's parameters.
 
         Every ``bool`` shares one checkbox group, because "which of these are on" is one
-        question; every dropdown and every number gets an input of its own, since Slack keys a
-        submitted value by the block it was in. Dropdowns come before numbers, so a number that
-        only matters for one pick (a custom angle) sits below the pick. The scan has already
-        refused any parameter type without a mapping, so a parameter reaching here that is none
-        of these is a bug in the scan rather than a bad Action.
+        question; every dropdown and every number or text field gets an input of its own, since
+        Slack keys a submitted value by the block it was in. Dropdowns come before numbers, so a
+        number that only matters for one pick (a custom angle) sits below the pick; text fields
+        come last. The scan has already refused any parameter type without a mapping, so a
+        parameter reaching here that is none of these is a bug in the scan rather than a bad
+        Action.
         """
         booleans = [p for p in act.parameters if p.annotation is bool]
         blocks = [cls._checkbox_block(booleans, initial)] if booleans else []
         blocks += [cls._select_block(p, initial) for p in act.parameters if is_choice(p.annotation)]
         blocks += [cls._number_block(p, initial) for p in act.parameters if p.annotation in NUMBER_TYPES]
+        blocks += [cls._text_block(p, initial) for p in act.parameters if p.annotation in TEXT_TYPES]
         return blocks
 
     @staticmethod
@@ -479,6 +485,25 @@ class WhobotSlack(Whobot):
                 "type": "number_input",
                 "action_id": _param_block(parameter.name),
                 "is_decimal_allowed": parameter.annotation is float,
+                "initial_value": str(initial.get(parameter.name, parameter.default)),
+            },
+        }
+
+    @staticmethod
+    def _text_block(parameter: Parameter, initial: dict[str, object]) -> Block:
+        """Render one ``str`` parameter as a single-line text field, opened on its starting value.
+
+        Optional, so an operator who clears it gets the Action's default rather than a form that
+        refuses to submit.
+        """
+        return {
+            "type": "input",
+            "block_id": _param_block(parameter.name),
+            "optional": True,
+            "label": {"type": "plain_text", "text": _param_label(parameter)},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": _param_block(parameter.name),
                 "initial_value": str(initial.get(parameter.name, parameter.default)),
             },
         }

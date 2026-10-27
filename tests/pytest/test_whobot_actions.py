@@ -256,11 +256,24 @@ def test_a_parameter_type_with_no_widget_is_rejected_by_name() -> None:
 
     class Bad:
         @action(label="Bad")
-        async def bad(self, *, reason: str = "") -> Report:
+        async def bad(self, *, blob: bytes = b"") -> Report:
             return OK
 
-    with pytest.raises(ActionDeclarationError, match=r"'bad'.*'reason'.*no widget"):
+    with pytest.raises(ActionDeclarationError, match=r"'bad'.*'blob'.*no widget"):
         scan_actions(Bad)
+
+
+def test_a_str_parameter_becomes_a_text_field_with_an_empty_default() -> None:
+    """`str` is the fourth widget: free text, such as a string of Answers."""
+
+    class Typed:
+        @action(label="Typed")
+        async def typed(self, *, answers: str) -> Report:
+            return OK
+
+    parameter = scan_actions(Typed)["typed"].parameters[0]
+    assert parameter.annotation is str
+    assert parameter.default == ""
 
 
 def test_an_unannotated_parameter_is_rejected() -> None:

@@ -25,6 +25,7 @@ from dataclasses import field
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import ClassVar
 from zoneinfo import ZoneInfo
@@ -58,11 +59,13 @@ from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeClient
 from pqn_whobot.registry import Node
 from pqn_whobot.whobot import GAME_TITLES
+from pqn_whobot.whobot import OPERATION_MODE_LABEL
 from pqn_whobot.whobot import Whobot
 from pqn_whobot.whobot import _bell_verdict
 from pqn_whobot.whobot import _hardware_section
 from pqn_whobot.whobot import one_game_budget
 from pqn_whobot.whobot import one_node_budget
+from pqn_whobot.whobot import ssm_budget
 
 ALICE = "http://node-a.invalid:9000"
 BOB = "http://node-b.invalid:9000"
@@ -1286,13 +1289,25 @@ SWEEP = {
 ALL_GAMES_ON = {"chsh": True, "qf": True, "ssm": True}
 
 
-def node_api(
+def node_api(  # noqa: PLR0913 - one keyword per endpoint a check-up can hit, so a test sets one
     *,
     availability: object = ALL_GAMES_ON,
     refuse: dict[str, int] | None = None,
     seen: list[httpx.Request] | None = None,
+    mode: str = "entanglement",
+    follower: str | None = None,
+    follower_mode: str = "correlation",
+    follower_refuses: bool = False,
+    unattended: object = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Answer every endpoint a check-up calls, with any of them able to refuse instead."""
+    """Answer every endpoint a check-up calls, with any of them able to refuse instead.
+
+    ``follower`` is the address ``/node/config`` reports, and is ``None`` by default — no
+    follower configured, so the digest reads no follower mode. A request whose host is that
+    follower is answered with ``follower_mode``, so a mismatch can be set up, or refused by
+    connection when ``follower_refuses`` is set, for a follower that cannot be read. ``unattended``
+    is the SSM game's answer; the default is a clean entanglement-mode game over eight questions.
+    """
     refusals = refuse or {}
     answers: dict[str, object] = {
         "/health/": HEALTHY,
@@ -1300,12 +1315,21 @@ def node_api(
         "/chsh/": CHSH,
         "/chsh/sweep": SWEEP,
         "/rng/fortune": [42, 137],
+        "/node/operation_mode": mode,
+        "/node/config": {"node_name": "uiuc-public-left", "follower_node_address": follower},
+        "/qkd/unattended": unattended if unattended is not None else entangled([0] * 8, [0] * 8),
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
             seen.append(request)
         path = request.url.path
+        is_follower = follower is not None and request.url.host == follower
+        if is_follower and follower_refuses:
+            msg = f"{follower} is not answering"
+            raise httpx.ConnectError(msg, request=request)
+        if is_follower and path == "/node/operation_mode":
+            return httpx.Response(200, json=follower_mode)
         if path in refusals:
             return httpx.Response(refusals[path], json={"detail": f"{path} is not having it"})
         if path not in answers:
@@ -1382,22 +1406,233 @@ def test_an_unviolated_bell_inequality_warns_rather_than_fails() -> None:
 # --- one Node's whole check-up ---
 
 
-def test_a_healthy_node_reports_its_hardware_and_both_games() -> None:
+def test_a_healthy_node_reports_its_hardware_its_mode_and_every_game() -> None:
     digest = checked(with_node_api(node_api(), ALICE))
 
     assert digest.status is Status.OK
-    assert list(sections_of(digest)) == ["Hardware", *GAME_TITLES.values()]
+    # The literal heading is named, so a rename of the section is a failed test rather than a
+    # silently different report for the operator.
+    assert list(sections_of(digest)) == ["Hardware", "Operation mode", *GAME_TITLES.values()]
     chsh = sections_of(digest)[GAME_TITLES["chsh"]]
     assert next(f.value for f in chsh.fields if f.name == "S") == "2.6135 ± 0.0400"
     assert chsh.note is not None, "a Game reports how long it took"
 
 
-def test_ssm_is_always_skipped_and_says_why() -> None:
-    """It needs an interactive coordination dance, so no unattended run can play it."""
+def test_the_ssm_section_is_played_when_the_node_offers_it() -> None:
+    """An unattended run can play SSM now (decision 10), so the digest does."""
     ssm = sections_of(checked(with_node_api(node_api(), ALICE)))[GAME_TITLES["ssm"]]
 
+    assert ssm.status is Status.OK
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "entanglement"
+
+
+def test_an_ssm_section_the_node_does_not_offer_is_skipped_like_the_other_games() -> None:
+    """A Game switched off on purpose is skipped, with the same wording as CHSH and QF."""
+    digest = checked(with_node_api(node_api(availability={"chsh": True, "qf": True, "ssm": False}), ALICE))
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
     assert ssm.status is Status.SKIPPED
-    assert "coordination dance" in ssm.fields[0].value
+    assert ssm.fields[0].value == "Not available on this Node."
+    assert digest.status is Status.OK, "a Game switched off on purpose is not bad news"
+
+
+# --- the Operation mode section: each Node's mode, and its follower's (decision 9, A13) ---
+
+
+def test_every_node_reports_its_operation_mode() -> None:
+    """The mode is a Node-level fact, reported whatever Games it offers and in both modes."""
+    entanglement = sections_of(checked(with_node_api(node_api(mode="entanglement"), ALICE)))
+    correlation = sections_of(checked(with_node_api(node_api(mode="correlation"), ALICE)))
+
+    assert {field.name: field.value for field in entanglement[OPERATION_MODE_LABEL].fields}["Operation mode"] == (
+        "entanglement"
+    )
+    assert {field.name: field.value for field in correlation[OPERATION_MODE_LABEL].fields}["Operation mode"] == (
+        "correlation"
+    )
+
+
+def test_the_mode_is_reported_even_when_the_node_offers_no_games() -> None:
+    """Decision 9: the mode changes what the GUI tells CHSH players too, so it is always read."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(availability={"chsh": False, "qf": False, "ssm": False}, seen=seen), ALICE))
+
+    assert sections_of(digest)[OPERATION_MODE_LABEL].status is Status.OK
+    assert "/node/operation_mode" in [request.url.path for request in seen]
+
+
+def test_the_mode_read_is_reused_by_the_ssm_section() -> None:
+    """The mode is read once per Node, and the SSM section is handed what was already read."""
+    seen: list[httpx.Request] = []
+    checked(with_node_api(node_api(seen=seen), ALICE))
+
+    reads = [request for request in seen if request.url.path == "/node/operation_mode"]
+    assert len(reads) == 1, "the mode is read once and reused for the SSM report"
+
+
+def test_a_node_whose_own_mode_cannot_be_read_warns_and_the_ssm_section_fails_on_its_own() -> None:
+    """A mode read that fails is a WARN on the mode section; the SSM section then fails too.
+
+    The SSM section needs the mode to pick its default Answers, so with no Answers given it
+    reports the failure rather than playing. Its mode row says "unknown".
+    """
+    digest = checked(with_node_api(node_api(refuse={"/node/operation_mode": 503}), ALICE))
+
+    mode_section = sections_of(digest)[OPERATION_MODE_LABEL]
+    assert mode_section.status is Status.WARN
+    assert mode_section.error is not None
+    # The row still says which fact is unknown, so the section reads as a report rather than a blank.
+    mode_row = next(field for field in mode_section.fields if field.name == "Operation mode")
+    assert mode_row.value == "unknown"
+    assert mode_row.status is Status.WARN
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert ssm.status is Status.FAIL
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "unknown"
+
+
+def test_a_config_read_that_fails_warns_the_follower_row_and_asks_no_follower() -> None:
+    """When this Node's own config cannot be read, the follower is unknown and never asked."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(refuse={"/node/config": 503}, seen=seen), ALICE, node_timeout_s=0.5))
+
+    follower = next(
+        field for field in sections_of(digest)[OPERATION_MODE_LABEL].fields if field.name == "Follower mode"
+    )
+    assert follower.status is Status.WARN
+    assert follower.value.startswith("unknown")
+    assert "config" in follower.value
+    assert {request.url.host for request in seen} == {"node-a.invalid"}, "only this Node was asked"
+
+
+def test_a_matching_follower_mode_is_shown_without_a_warning() -> None:
+    """Decision 9: only a *difference* is a mistake worth flagging.
+
+    The follower is asked at ``http://<address>/node/operation_mode`` (A13): Nodes serve plain
+    HTTP, so an https request would never be answered and every follower would read as unknown.
+    """
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(mode="correlation", follower="10.0.0.9", seen=seen), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "correlation"
+    assert section.status is Status.OK
+    follower_request = next(request for request in seen if request.url.host == "10.0.0.9")
+    assert str(follower_request.url) == "http://10.0.0.9/node/operation_mode"
+
+
+def test_a_follower_in_a_different_mode_warns_and_names_both() -> None:
+    """A mismatch is an operator mistake; the flag names both modes so it can be fixed."""
+    digest = checked(with_node_api(node_api(mode="entanglement", follower="10.0.0.9"), ALICE, node_timeout_s=0.5))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.WARN
+    assert "correlation" in follower.value
+    assert "entanglement" in follower.value
+    assert section.status is Status.WARN
+
+
+def test_a_follower_mode_that_cannot_be_read_shows_unknown_and_warns() -> None:
+    """A13: an unreadable follower must WARN, so a mismatch is never hidden."""
+    digest = checked(with_node_api(node_api(follower="down.invalid", follower_refuses=True), ALICE, node_timeout_s=0.5))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.WARN
+    assert follower.value.startswith("unknown")
+    assert section.status is Status.WARN
+
+
+def test_no_configured_follower_is_said_without_a_warning() -> None:
+    """A13: no follower configured means no flag — and no follower mode is even asked for."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(follower=None, seen=seen), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "none configured"
+    assert section.status is Status.OK
+    assert [request.url.path for request in seen].count("/node/config") == 1
+
+
+def test_an_empty_follower_address_is_treated_as_none_configured() -> None:
+    """A13: an empty address is a Node with no follower — not one at an empty host.
+
+    Otherwise the row would WARN "unknown at :", and Whobot would try to open a connection to a
+    host that does not exist.
+    """
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(follower="", seen=seen), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "none configured"
+    assert section.status is Status.OK
+    assert {request.url.host for request in seen} == {"node-a.invalid"}, "no empty-host follower was asked"
+
+
+def test_the_digests_ssm_check_follows_the_nodes_mode() -> None:
+    """Decision 13: the digest's SSM check is the mode's — correlation reports rates vs references."""
+    seen: list[httpx.Request] = []
+    digest = checked(
+        with_node_api(
+            node_api(
+                mode="correlation",
+                unattended=correlated([3000.0, 1500.0, 1500.0, 750.0], ["high", "medium", "medium", "low"]),
+                seen=seen,
+            ),
+            ALICE,
+            ssm_questions=4,
+        )
+    )
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "correlation"
+    assert ssm.status is Status.OK
+    assert "/node/calibration" in [request.url.path for request in seen], "correlation shows rates vs references"
+
+
+def test_the_digest_ssm_game_uses_the_configured_question_count_and_no_integration_time() -> None:
+    """The digest plays ``ssm_questions`` questions and sends no integration time (decision 13, A9).
+
+    A non-default count is used so a hard-coded number would fail, and A9's "no time" is pinned by
+    the absence of ``integration_time_s``: the Node then measures as its GUI game does.
+    """
+    seen: list[httpx.Request] = []
+    checked(
+        with_node_api(
+            node_api(unattended=entangled([0] * 6, [0] * 6), seen=seen),
+            ALICE,
+            ssm_questions=6,
+        )
+    )
+
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    body = json.loads(game.content)
+    assert body == {"leader_answers": ["a"] * 3 + ["b"] * 3, "follower_answers": ["a"] * 3 + ["b"] * 3}
+    assert "integration_time_s" not in game.url.params
+
+
+def test_the_digests_ssm_status_follows_the_configured_max_error_rate() -> None:
+    """Decision 13: the SSM section WARNs when a basis's error rate is above ``ssm_max_error_rate``.
+
+    A non-default threshold is used so a hard-coded 0.15 would fail: the bits disagree on every
+    compared question, so the rate is 1.0 and the check warns against the configured 0.25.
+    """
+    digest = checked(
+        with_node_api(
+            node_api(unattended=entangled([0, 0, 0, 0], [1, 1, 1, 1])), ALICE, ssm_questions=4, ssm_max_error_rate=0.25
+        )
+    )
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert ssm.status is Status.WARN
+    fields = {field.name: field for field in ssm.fields}
+    assert fields["Max error rate"].value == "0.25"
 
 
 def test_a_failed_hardware_probe_does_not_stop_the_games() -> None:
@@ -1539,13 +1774,18 @@ def test_a_game_action_is_allowed_the_game_plus_the_call_that_starts_it() -> Non
     assert one_game_budget(generous) == pytest.approx(930.0)
 
 
-def test_checking_a_node_is_allowed_both_its_games() -> None:
-    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody."""
+def test_checking_a_node_is_allowed_every_call_and_game_it_makes() -> None:
+    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody.
+
+    The budget is the sum of what a Node's check-up spends: six reads (hardware, availability,
+    Operation mode, follower address, the follower's mode and a correlation-mode calibration)
+    and three Games (CHSH, Quantum Fortune and SSM).
+    """
     settings = settings_for()
 
-    assert one_node_budget(settings) == pytest.approx(2 * 30.0 + 2 * 600.0)
+    assert one_node_budget(settings) == pytest.approx(6 * 30.0 + 3 * 600.0)
     assert FlowSpy.actions["check_node"].timeout_for(settings) == pytest.approx(one_node_budget(settings))
-    assert one_node_budget(settings) >= 2 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
+    assert one_node_budget(settings) >= 3 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
 
 
 def test_a_budget_that_cannot_be_worked_out_falls_back_rather_than_refusing_to_run() -> None:
@@ -1947,6 +2187,664 @@ def test_the_schedule_action_refuses_what_the_config_would(
     assert report.status is Status.FAIL
     assert (bot.settings.schedule_hour, bot.settings.schedule_minute) == (7, 0)
     assert not Path("whobot.toml").exists(), "a refused schedule must not touch the file"
+
+
+# --------------------------------------------------------------------------------------
+# Run SSM: the unattended Share a Secret Message game, by hand.
+#
+# Decision 13's report, decision 14's prefilled form and decision 15's leader-only scope,
+# over a mocked Node API. The Nodes themselves are the 3.1 endpoint's own tests' business;
+# here Whobot's half is pinned: what it asks for, and what it says about the answer.
+# --------------------------------------------------------------------------------------
+
+SSM_CALIBRATION = {
+    "polarization_angles": {"h": 0.0, "v": 45.0, "d": 22.5, "a": -22.5},
+    "reference_rates": {"vv": 3000.0, "vd": 1500.0, "dd": 750.0},
+}
+
+
+def ssm_api(
+    *,
+    mode: str = "entanglement",
+    unattended: object = None,
+    unattended_status: int = 200,
+    calibration: object = SSM_CALIBRATION,
+    seen: list[httpx.Request] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the three endpoints a Run SSM touches, recording every call made.
+
+    ``GET /node/operation_mode`` decides the prefill's pattern, ``POST /qkd/unattended`` is the
+    game itself and ``GET /node/calibration`` supplies the Reference rates the correlation
+    report shows beside each measured one.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        path = request.url.path
+        if path == "/node/operation_mode":
+            return httpx.Response(200, json=mode)
+        if path == "/node/calibration":
+            return httpx.Response(200, json=calibration)
+        if path == "/qkd/unattended":
+            if unattended_status != HTTPStatus.OK:
+                return httpx.Response(unattended_status, json={"detail": "the game did not finish"})
+            return httpx.Response(HTTPStatus.OK, json=unattended)
+        return httpx.Response(404)
+
+    return handler
+
+
+def entangled(leader_bits: list[int], follower_bits: list[int]) -> dict[str, object]:
+    return {"mode": "entanglement", "leader_bits": leader_bits, "follower_bits": follower_bits}
+
+
+def correlated(rates: list[float], levels: list[str]) -> dict[str, object]:
+    return {"mode": "correlation", "rates": rates, "levels": levels}
+
+
+def ssm_form(**overrides: object) -> dict[str, object]:
+    """Return a complete Run SSM form, so a test changes only the field it is about."""
+    return {
+        "questions": 4,
+        "leader_answers": "aabb",
+        "follower_answers": "aabb",
+        "max_error_rate": 0.15,
+        "integration_time_s": 0.0,
+        **overrides,
+    }
+
+
+def ssm_section(result: ActionResult) -> Section:
+    """Return the single SSM section off the result, whichever Report shape it took."""
+    assert isinstance(result, Report)
+    return result.sections[0]
+
+
+def run_ssm(bot: ClientSpy, *, node_url: str = ALICE, **overrides: object) -> Report:
+    """Run Run SSM from a complete form and return the Report it posted."""
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=node_url, params=ssm_form(**overrides))))
+    return only_report(bot)
+
+
+# --- the prefill: config and the Node's Operation mode ---
+
+
+def test_the_ssm_form_opens_on_the_entanglement_pattern() -> None:
+    """Decision 13: all Questions matching, the first half both left and the rest both right."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(mode="entanglement", seen=seen), ALICE, ssm_questions=6, ssm_max_error_rate=0.2)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=ALICE)))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert [(request.method, request.url.path) for request in seen] == [("GET", "/node/operation_mode")]
+    assert bot.drawn.initial == {
+        "questions": 6,
+        "leader_answers": "aaabbb",
+        "follower_answers": "aaabbb",
+        "max_error_rate": 0.2,
+        "integration_time_s": 0.0,
+    }
+
+
+def test_the_ssm_form_opens_on_the_correlation_pattern() -> None:
+    """Decision 13: the four Answer combinations in turn, so every expected level is exercised."""
+    bot = with_node_api(ssm_api(mode="correlation"), ALICE, ssm_questions=8)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=ALICE)))
+
+    assert bot.drawn.initial["leader_answers"] == "aabbaabb"
+    assert bot.drawn.initial["follower_answers"] == "abababab"
+    assert bot.drawn.initial["questions"] == 8  # noqa: PLR2004 - the config's value
+
+
+def test_an_odd_question_count_gives_the_extra_question_to_left() -> None:
+    """A10: with an odd count the extra one is 'a', so 7 questions read "aaaabbb" on both sides.
+
+    Handing the extra question to the right would read "aaabbbb", changing which basis gets the
+    odd bit and so what the digest's two bases are compared over.
+    """
+    bot = with_node_api(ssm_api(mode="entanglement"), ALICE, ssm_questions=7)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=ALICE)))
+
+    assert bot.drawn.initial["leader_answers"] == "aaaabbb"
+    assert bot.drawn.initial["follower_answers"] == "aaaabbb"
+
+
+def test_the_ssm_form_falls_back_on_its_defaults_when_it_cannot_read_a_mode() -> None:
+    """A form opening on defaults beats no form, so a Node that cannot be read must not block it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(503, json={"detail": "down for maintenance"})
+
+    bot = with_node_api(handler, ALICE, ssm_questions=8)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_ssm", node_url=ALICE)))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert bot.drawn.initial == {
+        "questions": 8,
+        "leader_answers": "",
+        "follower_answers": "",
+        "max_error_rate": 0.15,
+        "integration_time_s": 0.0,
+    }
+
+
+def test_the_ssm_form_asks_for_every_default_decision_14_names() -> None:
+    """Questions, both players' Answers, the error threshold and the integration time, each a field."""
+    act = WhobotSpy.actions["run_ssm"]
+
+    assert act.label == "Run SSM"
+    assert act.scope is Scope.ONE
+    assert {parameter.name for parameter in act.parameters} == {
+        "questions",
+        "leader_answers",
+        "follower_answers",
+        "max_error_rate",
+        "integration_time_s",
+    }
+
+
+# --- the payload ---
+
+
+def test_running_ssm_sends_both_players_answers_and_the_integration_time() -> None:
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE, timetagger_address="10.0.0.5:9000"
+    )
+
+    run_ssm(bot, questions=2, leader_answers="ab", follower_answers="ba", integration_time_s=2.0)
+
+    request = next(r for r in seen if r.url.path == "/qkd/unattended")
+    assert request.method == "POST"
+    assert json.loads(request.content) == {"leader_answers": ["a", "b"], "follower_answers": ["b", "a"]}
+    assert request.url.params["timetagger_address"] == "10.0.0.5:9000"
+    assert float(request.url.params["integration_time_s"]) == 2.0  # noqa: PLR2004 - the form's value
+
+
+def test_running_ssm_sends_no_integration_time_when_the_field_is_zero() -> None:
+    """Decision A9: 0 means the Node's own configured integration time, so no time is sent."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE)
+
+    run_ssm(bot, questions=2, leader_answers="aa", follower_answers="aa", integration_time_s=0.0)
+
+    request = next(r for r in seen if r.url.path == "/qkd/unattended")
+    assert "integration_time_s" not in request.url.params
+
+
+def test_upper_case_answers_are_sent_as_lower_case() -> None:
+    """The Node accepts either case; Whobot normalises so the report's own comparisons agree."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE)
+
+    run_ssm(bot, questions=2, leader_answers="AB", follower_answers="AB")
+
+    request = next(r for r in seen if r.url.path == "/qkd/unattended")
+    assert json.loads(request.content) == {"leader_answers": ["a", "b"], "follower_answers": ["a", "b"]}
+
+
+def test_the_ssm_game_is_given_the_per_game_timeout_not_the_node_read_timeout() -> None:
+    """A Game runs for minutes, so its call is bounded by ``per_game_timeout_s``, not the reads'.
+
+    The mode and calibration reads spend ``node_timeout_s``; the game is the long call and must
+    carry the longer bound, or a real game is cut off partway through.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(mode="correlation", unattended=correlated([3000.0], ["high"]), seen=seen),
+        ALICE,
+        node_timeout_s=7.5,
+        per_game_timeout_s=901.0,
+    )
+
+    run_ssm(bot, questions=1, leader_answers="a", follower_answers="a")
+
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    reads = [request for request in seen if request.url.path != "/qkd/unattended"]
+    assert game.extensions["timeout"] == httpx.Timeout(901.0).as_dict()
+    assert reads, "the mode and calibration reads are separate calls"
+    assert all(request.extensions["timeout"] == httpx.Timeout(7.5).as_dict() for request in reads)
+
+
+# --- refusing Answers, without touching the Node ---
+
+
+@pytest.mark.parametrize(
+    ("form", "because"),
+    [
+        ({"questions": 2, "leader_answers": "aa", "follower_answers": "a"}, "same length"),
+        ({"questions": 3, "leader_answers": "aa", "follower_answers": "aa"}, "do not match 3 questions"),
+        ({"questions": 2, "leader_answers": "ac", "follower_answers": "ac"}, "must be a and b"),
+        ({"questions": 2, "leader_answers": "aa", "follower_answers": "ax"}, "must be a and b"),
+    ],
+    ids=["unequal length", "wrong count", "bad leader Answer", "bad follower Answer"],
+)
+def test_the_ssm_action_refuses_answers_it_cannot_play(form: dict[str, object], because: str) -> None:
+    """Decision 14: unequal-length Answers are refused, and so is anything else unplayable.
+
+    A typo must be a clear refusal rather than a Node call that fails somewhere less useful — so
+    the game is never started — and the refusal states the mode (decision 13), which means it
+    does read the mode first.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE)
+
+    report = run_ssm(bot, **form)
+
+    assert report.status is Status.FAIL
+    fields = {field.name: field for field in ssm_section(report).fields}
+    assert because in fields["Answers"].value
+    assert fields["Operation mode"].value == "entanglement"
+    assert [request.url.path for request in seen] == ["/node/operation_mode"], "the game must not start"
+    assert fields["Answers"].status is Status.FAIL, "a refused Answer is a failure, not a warning"
+
+
+@pytest.mark.parametrize(
+    ("leader", "follower"),
+    [("aa", ""), ("", "aa")],
+    ids=["empty follower", "empty leader"],
+)
+def test_one_empty_answer_field_is_refused_rather_than_filled_with_defaults(leader: str, follower: str) -> None:
+    """A10: *both* fields empty means the mode's defaults; one empty is an unequal-length refusal.
+
+    Reading one empty field as "both empty" would silently play the mode's own Answers for a
+    game the operator only half asked for, hiding their mistake instead of reporting it.
+    """
+    seen: list[httpx.Request] = []
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0]), seen=seen), ALICE)
+
+    report = run_ssm(bot, questions=2, leader_answers=leader, follower_answers=follower)
+
+    assert report.status is Status.FAIL
+    assert "same length" in {field.name: field for field in ssm_section(report).fields}["Answers"].value
+    assert "/qkd/unattended" not in [request.url.path for request in seen], "no game was played"
+
+
+# --- the report, entanglement mode ---
+
+
+def test_an_entanglement_ssm_report_names_the_node_it_checked() -> None:
+    """An operator runs Run SSM on one Node, so the title must say which leader was checked."""
+    bot = with_node_api(ssm_api(unattended=entangled([0, 1, 0, 1], [0, 1, 0, 1])), ALICE)
+
+    report = run_ssm(bot)
+
+    assert report.title == f"{GAME_TITLES['ssm']} — uiuc-public-left"
+
+
+def test_an_entanglement_ssm_report_shows_the_error_rate_per_basis() -> None:
+    """Decision 13: the mode is stated, and each basis gets its own bit error rate."""
+    bot = with_node_api(ssm_api(unattended=entangled([0, 1, 0, 1], [0, 1, 0, 1])), ALICE)
+
+    report = run_ssm(bot)
+
+    assert report.status is Status.OK
+    section = ssm_section(report)
+    assert section.label == GAME_TITLES["ssm"]
+    assert section.status is Status.OK
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "entanglement"
+    assert fields["H/V error rate"].value == "0.0000 (0 of 2 bits mismatched)"
+    assert fields["H/V error rate"].status is Status.OK
+    assert fields["D/A error rate"].status is Status.OK
+    assert fields["Max error rate"].value == "0.15"
+
+
+def test_an_entanglement_ssm_report_warns_when_a_basis_error_rate_is_above_the_threshold() -> None:
+    """One of the two H/V bits is wrong: 0.5 is above 0.15, so the check WARNs."""
+    bot = with_node_api(ssm_api(unattended=entangled([0, 1, 0, 1], [1, 1, 0, 1])), ALICE)
+
+    report = run_ssm(bot)
+
+    section = ssm_section(report)
+    assert section.status is Status.WARN
+    fields = {field.name: field for field in section.fields}
+    assert fields["H/V error rate"].value == "0.5000 (1 of 2 bits mismatched)"
+    assert fields["H/V error rate"].status is Status.WARN
+    assert fields["D/A error rate"].status is Status.OK
+
+
+def test_a_basis_under_the_threshold_is_ok_and_the_report_says_the_threshold() -> None:
+    """Inclusive: a rate exactly at the threshold is OK, since decision 13 says at or under it."""
+    bot = with_node_api(ssm_api(unattended=entangled([0, 1, 0, 1], [1, 1, 0, 1])), ALICE)
+
+    report = run_ssm(bot, max_error_rate=0.5)
+
+    fields = {field.name: field for field in ssm_section(report).fields}
+    assert fields["H/V error rate"].status is Status.OK
+    assert fields["Max error rate"].value == "0.5"
+
+
+def test_an_entanglement_ssm_report_warns_for_a_basis_with_no_compared_question() -> None:
+    """Agent decision A11: a basis no question compared is not under the threshold, so it WARNs.
+
+    With Answers that never match on a basis, nothing there could be compared; an unchecked
+    basis must not read as OK.
+    """
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0], [0, 0])), ALICE)
+
+    report = run_ssm(bot, questions=2, leader_answers="ab", follower_answers="ba")
+
+    section = ssm_section(report)
+    assert section.status is Status.WARN
+    fields = {field.name: field for field in section.fields}
+    assert fields["H/V error rate"].value == "not compared"
+    assert fields["H/V error rate"].status is Status.WARN
+    assert fields["D/A error rate"].value == "not compared"
+
+
+# --- the report, correlation mode ---
+
+
+def test_a_correlation_ssm_report_shows_each_rate_beside_its_reference() -> None:
+    """Decision 13: expected level from the Answers, measured level next to it, rate by reference."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(
+            mode="correlation",
+            unattended=correlated([3000.0, 1500.0, 1500.0, 750.0], ["high", "medium", "medium", "low"]),
+            seen=seen,
+        ),
+        ALICE,
+    )
+
+    report = run_ssm(bot, leader_answers="aabb", follower_answers="abab")
+
+    section = ssm_section(report)
+    assert section.status is Status.OK
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "correlation"
+    assert fields["Q1"].value == "3000 cps, reference 3000, measured high, expected high"
+    assert fields["Q2"].value == "1500 cps, reference 1500, measured medium, expected medium"
+    assert fields["Q4"].value == "750 cps, reference 750, measured low, expected low"
+    assert all(field.status is Status.OK for name, field in fields.items() if name.startswith("Q"))
+    assert [request.url.path for request in seen if request.url.path == "/node/calibration"] == ["/node/calibration"]
+
+
+def test_a_correlation_ssm_report_warns_when_a_question_is_misclassified() -> None:
+    """A question whose measured level is not the expected one is a WARN, and the rate shows why."""
+    bot = with_node_api(
+        ssm_api(
+            mode="correlation",
+            unattended=correlated([3000.0, 3000.0, 1500.0, 750.0], ["high", "high", "medium", "low"]),
+        ),
+        ALICE,
+    )
+
+    report = run_ssm(bot, leader_answers="aabb", follower_answers="abab")
+
+    section = ssm_section(report)
+    assert section.status is Status.WARN
+    fields = {field.name: field for field in section.fields}
+    assert fields["Q2"].value == "3000 cps, reference 1500, measured high, expected medium"
+    assert fields["Q2"].status is Status.WARN
+    assert fields["Q3"].status is Status.OK
+
+
+def test_a_correlation_report_says_so_when_the_reference_rates_cannot_be_read() -> None:
+    """A Reference rate that cannot be read is shown as unknown, and does not change the verdict.
+
+    Decision 13: OK when every question gets its *expected* Coincidence level. With the level
+    right, the missing Reference rate is a gap in the row's text, not a WARN.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/node/calibration":
+            return httpx.Response(503, json={"detail": "not set"})
+        return ssm_api(mode="correlation", unattended=correlated([3000.0], ["high"]))(request)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=1, leader_answers="a", follower_answers="a")
+
+    section = ssm_section(report)
+    fields = {field.name: field for field in section.fields}
+    assert fields["Q1"].value == "3000 cps, reference unknown, measured high, expected high"
+    assert fields["Q1"].status is Status.OK
+    assert section.status is Status.OK
+
+
+def test_a_misclassified_question_is_a_warn_with_or_without_a_reference_rate() -> None:
+    """The verdict follows the level comparison alone, so an unread Reference rate cannot hide it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/node/calibration":
+            return httpx.Response(503, json={"detail": "not set"})
+        return ssm_api(mode="correlation", unattended=correlated([3000.0], ["medium"]))(request)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=1, leader_answers="a", follower_answers="a")
+
+    fields = {field.name: field for field in ssm_section(report).fields}
+    assert fields["Q1"].value == "3000 cps, reference unknown, measured medium, expected high"
+    assert fields["Q1"].status is Status.WARN
+    assert ssm_section(report).status is Status.WARN
+
+
+# --- the game not completing ---
+
+
+def test_an_ssm_game_that_does_not_complete_is_a_fail() -> None:
+    """Decision 13: FAIL when the game does not complete, with the Node's own reason and the mode."""
+    bot = with_node_api(ssm_api(unattended_status=500), ALICE)
+
+    report = run_ssm(bot)
+
+    section = ssm_section(report)
+    assert report.status is Status.FAIL
+    assert section.status is Status.FAIL
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "entanglement"
+    assert fields["Result"].value == "The Game did not complete."
+    assert section.error is not None
+    assert "the game did not finish" in section.error
+
+
+def test_a_node_that_answers_an_unattended_game_with_something_else_is_a_fail() -> None:
+    """Something else on that port must not be read as an SSM result, and the mode is stated."""
+    bot = with_node_api(ssm_api(unattended={"hello": "world"}), ALICE)
+
+    report = run_ssm(bot)
+
+    section = ssm_section(report)
+    assert section.status is Status.FAIL
+    assert {field.name for field in section.fields} == {"Operation mode", "Result"}
+
+
+def test_a_failed_ssm_game_whose_mode_reports_correlation_states_correlation() -> None:
+    """The mode on a FAIL comes from the Node, so a correlation-mode failure says so."""
+    bot = with_node_api(ssm_api(mode="correlation", unattended_status=500), ALICE)
+
+    report = run_ssm(bot, leader_answers="aabb", follower_answers="abab")
+
+    fields = {field.name: field for field in ssm_section(report).fields}
+    assert fields["Operation mode"].value == "correlation"
+
+
+def test_the_ssm_action_reports_only_the_leader_it_was_given() -> None:
+    """Decision 15: Run SSM picks one Node; the Node resolves its own configured follower."""
+    act = WhobotSpy.actions["run_ssm"]
+    assert act.scope is Scope.ONE
+
+
+# --- empty Answers: the mode's own default pattern, per mode (A10) ---
+
+
+def test_empty_answers_play_the_entanglement_pattern() -> None:
+    """A10: both fields empty, so the game plays all-matching Answers for four questions."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(mode="entanglement", unattended=entangled([0, 0, 1, 1], [0, 0, 1, 1]), seen=seen), ALICE
+    )
+
+    report = run_ssm(bot, questions=4, leader_answers="", follower_answers="")
+
+    assert [(request.method, request.url.path) for request in seen] == [
+        ("GET", "/node/operation_mode"),
+        ("POST", "/qkd/unattended"),
+    ]
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    assert json.loads(game.content) == {
+        "leader_answers": ["a", "a", "b", "b"],
+        "follower_answers": ["a", "a", "b", "b"],
+    }
+    assert report.status is Status.OK
+
+
+def test_empty_answers_play_the_correlation_pattern() -> None:
+    """A10: the four Answer combinations in turn, so every expected level is exercised."""
+    seen: list[httpx.Request] = []
+    bot = with_node_api(
+        ssm_api(
+            mode="correlation",
+            unattended=correlated([3000.0, 1500.0, 1500.0, 750.0], ["high", "medium", "medium", "low"]),
+            seen=seen,
+        ),
+        ALICE,
+    )
+
+    report = run_ssm(bot, questions=4, leader_answers="", follower_answers="")
+
+    game = next(request for request in seen if request.url.path == "/qkd/unattended")
+    assert json.loads(game.content) == {
+        "leader_answers": ["a", "a", "b", "b"],
+        "follower_answers": ["a", "b", "a", "b"],
+    }
+    assert report.status is Status.OK
+
+
+def test_empty_answers_with_an_unreadable_mode_are_a_fail_with_no_game() -> None:
+    """With no Answers to play, the mode is the only source of them; a failed read is a FAIL."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/node/operation_mode":
+            return httpx.Response(503, json={"detail": "down for maintenance"})
+        return httpx.Response(404)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=4, leader_answers="", follower_answers="")
+
+    section = ssm_section(report)
+    assert report.status is Status.FAIL
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "unknown"
+    assert [request.url.path for request in seen] == ["/node/operation_mode"], "no game is started"
+
+
+def test_typed_answers_with_an_unreadable_mode_still_play() -> None:
+    """The mode only fills in defaults, so Answers an operator typed let the game run anyway."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/node/operation_mode":
+            return httpx.Response(503, json={"detail": "down for maintenance"})
+        if request.url.path == "/qkd/unattended":
+            return httpx.Response(200, json=entangled([0, 1, 0, 1], [0, 1, 0, 1]))
+        return httpx.Response(404)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=4, leader_answers="aabb", follower_answers="aabb")
+
+    assert report.status is Status.OK
+    assert "/qkd/unattended" in [request.url.path for request in seen]
+    # The game's own answer is the authority on the mode, so the report still states it.
+    assert {field.name: field for field in ssm_section(report).fields}["Operation mode"].value == "entanglement"
+
+
+def test_a_failed_game_with_an_unreadable_mode_says_the_mode_is_unknown() -> None:
+    """When the Node cannot be read and the game fails, the mode row says "unknown", not a guess.
+
+    Saying "entanglement" would assert a fact nobody established; the report must admit it does
+    not know the mode rather than claim the default.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/node/operation_mode":
+            return httpx.Response(503, json={"detail": "down for maintenance"})
+        if request.url.path == "/qkd/unattended":
+            return httpx.Response(500, json={"detail": "the game did not finish"})
+        return httpx.Response(404)
+
+    bot = with_node_api(handler, ALICE)
+
+    report = run_ssm(bot, questions=2, leader_answers="aa", follower_answers="aa")
+
+    section = ssm_section(report)
+    assert report.status is Status.FAIL
+    fields = {field.name: field for field in section.fields}
+    assert fields["Operation mode"].value == "unknown"
+    assert "/qkd/unattended" in [request.url.path for request in seen]
+
+
+# --- the partly compared basis: unmatched questions never count (test-reviewer-glm F3) ---
+
+
+def test_a_partly_compared_basis_counts_only_the_matched_questions() -> None:
+    """A basis with one compared question reads that one question, not the whole basis.
+
+    Answers "abab" against "aabb" match on Q1 (H/V) and Q4 (D/A) only; Q2 and Q3 are played
+    but never compared. Their bits are made to differ, so counting them would show a nonzero
+    rate on both bases; the report counts each basis' own compared question alone.
+    """
+    bot = with_node_api(ssm_api(unattended=entangled([0, 0, 0, 0], [0, 1, 1, 0])), ALICE)
+
+    report = run_ssm(bot, questions=4, leader_answers="abab", follower_answers="aabb")
+
+    section = ssm_section(report)
+    assert section.status is Status.OK
+    fields = {field.name: field for field in section.fields}
+    assert fields["H/V error rate"].value == "0.0000 (0 of 1 bits mismatched)"
+    assert fields["D/A error rate"].value == "0.0000 (0 of 1 bits mismatched)"
+
+
+def test_a_partly_compared_basis_counts_a_mismatch_on_its_compared_question() -> None:
+    """The mirrored case: the one compared question of each basis is mismatched, so both warn."""
+    bot = with_node_api(ssm_api(unattended=entangled([1, 0, 0, 1], [0, 1, 1, 0])), ALICE)
+
+    report = run_ssm(bot, questions=4, leader_answers="abab", follower_answers="aabb")
+
+    section = ssm_section(report)
+    fields = {field.name: field for field in section.fields}
+    assert fields["H/V error rate"].value == "1.0000 (1 of 1 bits mismatched)"
+    assert fields["D/A error rate"].value == "1.0000 (1 of 1 bits mismatched)"
+    assert section.status is Status.WARN
+
+
+# --- the time bound follows what the Action spends (reviewer-qwen F1) ---
+
+
+def test_the_ssm_action_is_allowed_its_game_and_both_its_node_reads() -> None:
+    """The bound is the sum of what Run SSM spends: the game and two Node reads (TimeoutSpec).
+
+    Unlike Run CHSH's ``one_game_budget``, Run SSM also reads the Operation mode and the
+    Reference rates, so its bound must carry those two calls or a completed game is thrown away.
+    """
+    settings = settings_for(node_timeout_s=30.0, per_game_timeout_s=600.0)
+
+    assert ssm_budget(settings) == pytest.approx(2 * 30.0 + 600.0)
+    assert FlowSpy.actions["run_ssm"].timeout_for(settings) == pytest.approx(ssm_budget(settings))
+    assert ssm_budget(settings) > one_game_budget(settings), "it spends more than Run CHSH"
+
+
+def test_the_ssm_bound_follows_the_configuration_it_spends() -> None:
+    """Raise either timeout and Run SSM's bound grows with it, with nothing else to edit."""
+    act = FlowSpy.actions["run_ssm"]
+
+    assert act.timeout_for(settings_for(node_timeout_s=10.0, per_game_timeout_s=900.0)) == pytest.approx(920.0)
+    assert ssm_budget(settings_for(node_timeout_s=7.5, per_game_timeout_s=100.0)) == pytest.approx(115.0)
 
 
 # --------------------------------------------------------------------------------------

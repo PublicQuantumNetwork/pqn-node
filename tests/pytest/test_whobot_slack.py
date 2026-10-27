@@ -23,6 +23,7 @@ from pqn_whobot.actions import PendingInvocation
 from pqn_whobot.actions import Report
 from pqn_whobot.actions import Section
 from pqn_whobot.actions import Status
+from pqn_whobot.actions import action
 from pqn_whobot.actions import scan_actions
 from pqn_whobot.config import NodeEntry
 from pqn_whobot.config import WhobotSettings
@@ -456,6 +457,65 @@ def test_an_action_with_no_booleans_renders_no_checkbox_group() -> None:
     blocks = WhobotSlack._form_blocks(chsh_action(), {})  # noqa: SLF001
 
     assert all(b["block_id"] != PARAMS_BLOCK for b in blocks)
+
+
+def ssm_action() -> Any:
+    return scan_actions(WhobotSlack)["run_ssm"]
+
+
+def test_a_str_parameter_becomes_a_single_line_text_field() -> None:
+    """The fourth widget mapping, and the reason a string of Answers can be typed from Slack."""
+    blocks = WhobotSlack._form_blocks(ssm_action(), {"leader_answers": "abab", "follower_answers": "aabb"})  # noqa: SLF001
+    texts = [b for b in blocks if b["element"]["type"] == "plain_text_input"]
+
+    assert [b["element"]["initial_value"] for b in texts] == ["abab", "aabb"]
+    assert [b["label"]["text"] for b in texts] == ["Leader Answers", "Follower Answers"]
+
+
+def test_the_answer_text_fields_are_optional() -> None:
+    """A cleared Answer field is "no answer", not a form that refuses to submit.
+
+    Leaving one empty falls back to the Action's default (A10), which a required Slack input
+    would never allow the operator to reach.
+    """
+    blocks = WhobotSlack._form_blocks(ssm_action(), {})  # noqa: SLF001
+    texts = [b for b in blocks if b["element"]["type"] == "plain_text_input"]
+
+    assert texts, "the Answers are text fields"
+    assert all(block["optional"] is True for block in texts)
+
+
+def test_a_text_field_reads_back_as_the_actions_str() -> None:
+    """Slack sends a text field's value as a plain string, which the Action declared as ``str``."""
+    act = ssm_action()
+    state = {
+        _param_block("leader_answers"): {_param_block("leader_answers"): {"type": "plain_text_input", "value": "ab"}},
+        _param_block("follower_answers"): {
+            _param_block("follower_answers"): {"type": "plain_text_input", "value": "ba"}
+        },
+    }
+
+    params = act.coerce_params(WhobotSlack._read_form(act, state))  # noqa: SLF001
+    assert params["leader_answers"] == "ab"
+    assert params["follower_answers"] == "ba"
+
+
+def test_a_text_field_left_empty_falls_back_to_the_actions_default() -> None:
+    """Like a number input, an empty text field is no answer rather than the empty string.
+
+    The Action's default is deliberately non-empty: Run SSM's own default for its Answers is
+    already "", so an assertion on that could not tell ``_read_form``'s guard from its absence.
+    """
+
+    class Typed:
+        @action(label="Typed")
+        async def typed(self, *, answers: str = "ab") -> Report:
+            return Report(status=Status.OK, title="typed")
+
+    act = scan_actions(Typed)["typed"]
+    state = {_param_block("answers"): {_param_block("answers"): {"type": "plain_text_input", "value": ""}}}
+
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"answers": "ab"}  # noqa: SLF001
 
 
 def test_a_number_input_reads_back_as_the_actions_float() -> None:

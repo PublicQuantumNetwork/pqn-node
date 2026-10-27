@@ -151,6 +151,42 @@ def test_the_timetagger_default_is_the_nodes_own_host_not_whobots(tmp_path: Path
     assert "localhost" not in settings.model_dump_json()
 
 
+def test_the_ssm_defaults_are_the_digest_checks_defaults(tmp_path: Path) -> None:
+    """Decision 13: 8 questions and a 0.15 per-basis error rate, both overridable in the file."""
+    (tmp_path / "whobot.toml").write_text("", encoding="utf-8")
+
+    settings = WhobotSettings()
+
+    assert settings.ssm_questions == 8  # noqa: PLR2004 - the default the plan states
+    assert settings.ssm_max_error_rate == 0.15  # noqa: PLR2004 - the default the plan states
+
+
+def test_the_ssm_values_come_from_the_file(tmp_path: Path) -> None:
+    (tmp_path / "whobot.toml").write_text("ssm_questions = 4\nssm_max_error_rate = 0.2\n", encoding="utf-8")
+
+    settings = WhobotSettings()
+
+    assert settings.ssm_questions == 4  # noqa: PLR2004 - the value written above
+    assert settings.ssm_max_error_rate == 0.2  # noqa: PLR2004 - the value written above
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("ssm_questions = 0\n", "ssm_questions"),
+        ("ssm_questions = -1\n", "ssm_questions"),
+        ("ssm_max_error_rate = -0.1\n", "ssm_max_error_rate"),
+        ("ssm_max_error_rate = 1.5\n", "ssm_max_error_rate"),
+    ],
+)
+def test_invalid_ssm_values_name_the_offending_key(tmp_path: Path, body: str, expected: str) -> None:
+    """A question count of zero is not a check, and a rate outside 0-1 is not a rate."""
+    (tmp_path / "whobot.toml").write_text(body, encoding="utf-8")
+
+    with pytest.raises(ValidationError, match=expected):
+        WhobotSettings()
+
+
 def test_unknown_timezone_is_rejected(tmp_path: Path) -> None:
     (tmp_path / "whobot.toml").write_text('schedule_timezone = "Mars/Olympus_Mons"\n', encoding="utf-8")
 
