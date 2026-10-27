@@ -8,6 +8,8 @@ to a section — and the two rendering rules that come from the data rather than
 
 import asyncio
 import json
+from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any
 
@@ -328,6 +330,104 @@ def test_an_upload_is_named_after_what_its_bytes_are(image: bytes, suffix: str) 
 def test_an_unrecognised_image_is_uploaded_as_a_png() -> None:
     """Every Action that produces one produces a PNG; the fallback must not be an error."""
     assert _image_suffix(b"something else entirely") == "png"
+
+
+PNG = b"\x89PNG\r\n\x1a\nrest of a screenshot"
+DIGEST_TS = "1700000000.000200"
+
+
+@dataclass
+class Posted:
+    """What a WhobotSlack sent to Slack, in order."""
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    uploads: list[dict[str, Any]] = field(default_factory=list)
+
+
+def recording_posts(bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch) -> Posted:
+    """Answer `chat.postMessage` and `files.upload_v2` by remembering them."""
+    posted = Posted()
+
+    async def post_message(**kwargs: Any) -> dict[str, Any]:
+        posted.messages.append(kwargs)
+        return {"ts": DIGEST_TS}
+
+    async def upload(**kwargs: Any) -> dict[str, Any]:
+        posted.uploads.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(bot.app.client, "chat_postMessage", post_message)
+    monkeypatch.setattr(bot.app.client, "files_upload_v2", upload)
+    return posted
+
+
+def digest_of(*images: bytes | None) -> DigestResult:
+    names = ["node1", "node2", "node3"]
+    return DigestResult(
+        status=Status.OK,
+        title="Daily Digest",
+        nodes=[
+            NodeDigest(name=name, api_url=f"http://{name}.invalid", status=Status.OK, image=image)
+            for name, image in zip(names, images, strict=False)
+        ],
+    )
+
+
+def test_a_scheduled_digests_screenshots_are_one_upload_threaded_under_it(
+    bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One clean digest in the channel; the pictures are one click away, not top-level."""
+    posted = recording_posts(bot, monkeypatch)
+
+    asyncio.run(bot.post_result(bot.actions["run_digest"], digest_of(PNG, PNG), bot.scheduled_handle()))
+
+    assert len(posted.messages) == 1
+    assert posted.messages[0]["thread_ts"] is None, "a scheduled digest is its own message"
+    assert len(posted.uploads) == 1
+    upload = posted.uploads[0]
+    assert upload["thread_ts"] == DIGEST_TS
+    assert [f["filename"] for f in upload["file_uploads"]] == ["node1.png", "node2.png"]
+
+
+def test_a_clicked_digests_screenshots_thread_under_its_announcement(
+    bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted = recording_posts(bot, monkeypatch)
+    reply = SlackReply(channel="C123", thread_ts="1700000000.000100")
+
+    asyncio.run(bot.post_result(bot.actions["check_node"], digest_of(PNG), reply))
+
+    assert posted.uploads[0]["thread_ts"] == "1700000000.000100"
+
+
+def test_a_digest_without_screenshots_uploads_nothing(bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = recording_posts(bot, monkeypatch)
+
+    asyncio.run(bot.post_result(bot.actions["run_digest"], digest_of(None, None), bot.scheduled_handle()))
+
+    assert len(posted.messages) == 1
+    assert posted.uploads == []
+
+
+def test_only_the_nodes_with_a_screenshot_are_uploaded(bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = recording_posts(bot, monkeypatch)
+
+    asyncio.run(bot.post_result(bot.actions["run_digest"], digest_of(None, PNG), bot.scheduled_handle()))
+
+    assert [f["filename"] for f in posted.uploads[0]["file_uploads"]] == ["node2.png"]
+
+
+def test_a_reports_image_without_a_thread_threads_under_the_new_message(
+    bot: WhobotSlack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rather than landing top-level in the channel as a message of its own."""
+    posted = recording_posts(bot, monkeypatch)
+    report = Report(status=Status.OK, title="Screenshot — node1", image=PNG)
+
+    asyncio.run(bot.post_result(bot.actions["screenshot"], report, SlackReply(channel="C123")))
+
+    assert posted.uploads[0]["thread_ts"] == DIGEST_TS
+    assert [f["filename"] for f in posted.uploads[0]["file_uploads"]] == ["screenshot.png"]
 
 
 # --------------------------------------------------------------------------------------

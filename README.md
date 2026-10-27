@@ -142,8 +142,9 @@ It does not run on a Node — put it anywhere that can reach them.
 
 Type `/whobot` in Slack and pick from a menu:
 
-- **Daily Digest** — every Node's hardware health *and* a real CHSH and Quantum Fortune run, in
-  one scheduled message. Also runnable on demand, and its schedule is changeable from the menu.
+- **Daily Digest** — every Node's hardware and GUI health, a Screenshot of its display, *and* a
+  real CHSH and Quantum Fortune run, in one scheduled message with the Screenshots in its
+  thread. Also runnable on demand, and its schedule is changeable from the menu.
 - **List Nodes / Node Info / Check one Node** — what is out there, and is it well.
 - **Screenshot / Reboot** — see a Node's screen, or restart it (with a confirm step).
 - **Change Game availability** — turn Games on and off without touching `config.toml`.

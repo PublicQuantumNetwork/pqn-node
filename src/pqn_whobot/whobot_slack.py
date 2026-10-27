@@ -539,24 +539,49 @@ class WhobotSlack(Whobot):
         return SlackReply(channel=self.settings.digest_channel)
 
     async def post_result(self, act: Action, result: ActionResult, reply: ReplyHandle) -> None:
-        """Post an Action's outcome as a threaded reply under its announcement."""
+        """Post an Action's outcome as a threaded reply under its announcement.
+
+        Images go in the thread too. A scheduled digest has no announcement to thread under,
+        so its images thread under the digest message itself rather than landing in the
+        channel as messages of their own.
+        """
         slack = self._slack(reply)
         blocks = self._render(result)
-        await self.app.client.chat_postMessage(
+        posted = await self.app.client.chat_postMessage(
             channel=slack.channel,
             thread_ts=slack.thread_ts,
             text=act.label,
             blocks=blocks,
         )
-        image = getattr(result, "image", None)
-        if image:
+        uploads = self._uploads(act, result)
+        if uploads:
+            # One call for every image, so a fleet's Screenshots arrive as one threaded message.
             await self.app.client.files_upload_v2(
                 channel=slack.channel,
-                thread_ts=slack.thread_ts,
-                file=image,
-                filename=f"{act.name}.{_image_suffix(image)}",
-                title=act.label,
+                thread_ts=slack.thread_ts or posted["ts"],
+                file_uploads=uploads,
             )
+
+    @staticmethod
+    def _uploads(act: Action, result: ActionResult) -> list[dict[str, Any]]:
+        """Every image a result carries, as ``files_upload_v2`` file entries.
+
+        A digest's images are named after their Node, since a fleet's arrive side by side.
+        """
+        if isinstance(result, DigestResult):
+            return [
+                {
+                    "file": node.image,
+                    "filename": f"{node.name}.{_image_suffix(node.image)}",
+                    "title": f"{result.title} — {node.name}",
+                }
+                for node in result.nodes
+                if node.image
+            ]
+        image = getattr(result, "image", None)
+        if not image:
+            return []
+        return [{"file": image, "filename": f"{act.name}.{_image_suffix(image)}", "title": act.label}]
 
     # ----------------------------------------------------------------------------------
     # Renderers: pure ActionResult -> blocks, so they can be tested without posting.
