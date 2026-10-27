@@ -15,6 +15,9 @@ from pqn_node.api.hardware import find_rotator
 from pqn_node.api.peers import measure_coincidences
 from pqn_node.api.peers import require_follower_address
 from pqn_node.constants import BasisBool
+from pqn_node.constants import CoincidenceLevel
+from pqn_node.constants import OperationMode
+from pqn_node.constants import QKDAngleValuesHWP
 from pqn_node.constants import QKDEncodingBasis
 from pqn_node.core.config import NodeRole
 from pqn_node.core.config import NodeState
@@ -34,6 +37,26 @@ class QKDResult(BaseModel):
     role: str
 
 
+def _answer_polarization(answer: QKDEncodingBasis) -> QKDAngleValuesHWP:
+    """Return the polarization one player's own Answer moves their waveplate to in correlation mode.
+
+    Decision 1: left (HV) → V, right (DA) → D, with no random bit. The Calibrated angle
+    applies where the move is made.
+    """
+    return QKDAngleValuesHWP.V if answer is QKDEncodingBasis.HV else QKDAngleValuesHWP.D
+
+
+def _coincidence_level(rate: float) -> CoincidenceLevel:
+    """Classify a coincidence rate by the nearest Reference rate (decision 7)."""
+    references = settings.correlation_settings.reference_rates
+    nearest = {
+        CoincidenceLevel.HIGH: references.vv,
+        CoincidenceLevel.MEDIUM: references.vd,
+        CoincidenceLevel.LOW: references.dd,
+    }
+    return min(nearest, key=lambda level: abs(nearest[level] - rate))
+
+
 async def _qkd(
     http_client: ClientDep,
     state: StateDep,
@@ -44,6 +67,9 @@ async def _qkd(
         follower_node_address = require_follower_address()
     logger.debug("Starting QKD")
     hwp = find_rotator(settings.qkd_settings.hwp)
+    # Every question is measured with this config; correlation mode also turns each count
+    # into a rate with its integration time.
+    cfg = settings.chsh_settings.measurement_config
 
     counts = []
     for basis in state.qkd_leader_basis_list:
@@ -57,17 +83,33 @@ async def _qkd(
             )
         logger.debug("Handshake with follower successful")
 
-        int_choice = secrets.randbits(1)  # FIXME: Make this real quantum random.
-        logger.debug("Chosen integer choice: %s", int_choice)
-        state.qkd_bit_list.append(int_choice)
-        # A move to a named polarization goes to its Calibrated angle, which is still a waveplate angle.
-        hwp_angle = settings.polarization_angles.waveplate_angle(basis.angles[int_choice])
+        if settings.operation_mode is OperationMode.CORRELATION:
+            # Decision 1: in correlation mode the Answer alone moves this Node's own
+            # waveplate (left → V, right → D); there is no random bit.
+            hwp_angle = settings.polarization_angles.waveplate_angle(_answer_polarization(basis))
+        else:
+            int_choice = secrets.randbits(1)  # FIXME: Make this real quantum random.
+            logger.debug("Chosen integer choice: %s", int_choice)
+            state.qkd_bit_list.append(int_choice)
+            # A move to a named polarization goes to its Calibrated angle, which is still a waveplate angle.
+            hwp_angle = settings.polarization_angles.waveplate_angle(basis.angles[int_choice])
         hwp.move_to(hwp_angle)
         logger.debug("Moving half waveplate to angle: %s", hwp_angle)
 
-        c = await measure_coincidences(http_client, timetagger_address, settings.chsh_settings.measurement_config)
+        c = await measure_coincidences(http_client, timetagger_address, cfg)
         counts.append(c)
         logger.debug("Counted %d coincidences", c)
+
+    if settings.operation_mode is OperationMode.CORRELATION:
+        # Decisions 1, 3 and 7: each count becomes a rate with the integration time it was
+        # measured with, and its nearest Reference rate classifies it. The follower's
+        # Answers are never fetched: a high or low Coincidence level means the two Answers
+        # agreed, a medium one means they did not.
+        agreement = [
+            int(_coincidence_level(count / cfg.integration_time_s) is not CoincidenceLevel.MEDIUM) for count in counts
+        ]
+        logger.info("Correlation-mode agreement: %s", agreement)
+        return agreement
 
     def get_outcome(state: int, basis: int, choice: int, counts: int) -> int:
         above = counts > settings.qkd_settings.discriminating_threshold
@@ -142,6 +184,13 @@ async def request_qkd_single_pass(state: StateDep) -> bool:
     # Get the basis choice from the follower basis list
     basis_choice = state.qkd_follower_basis_list[state.qkd_single_bit_current_index]
     state.qkd_single_bit_current_index += 1
+
+    if settings.operation_mode is OperationMode.CORRELATION:
+        # Decision 1: in correlation mode the Answer alone moves this Node's own waveplate
+        # (left → V, right → D), with no random bit. Decision 3: the leader never fetches
+        # this Node's Answers, so none are recorded for it.
+        hwp.move_to(settings.polarization_angles.waveplate_angle(_answer_polarization(basis_choice)))
+        return True
 
     int_choice = secrets.randbits(1)  # FIXME: Make this real quantum random.
 
@@ -320,9 +369,14 @@ async def _submit_basis_list_leader(
     ret = await _qkd(http_client, state, timetagger_address, follower_node_address=state.followers_address)
     logger.info("Final QKD bits: %s", str(ret))
 
+    # Decision 17: QKDResult keeps its shape. In correlation mode the bits are one per
+    # question, 1 where the Coincidence level says the two Answers agreed, so the matching
+    # count is their sum; in entanglement mode it is the length, one bit per matching Answer.
+    n_matching_bits = sum(ret) if settings.operation_mode is OperationMode.CORRELATION else len(ret)
+
     # Assemble QKDResult object
     qkd_result = QKDResult(
-        n_matching_bits=len(ret),
+        n_matching_bits=n_matching_bits,
         n_total_bits=settings.qkd_settings.bitstring_length,
         emoji=state.qkd_emoji_pick,
         role="leader",
