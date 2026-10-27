@@ -112,6 +112,14 @@ def _calibration_without(value: str) -> dict[str, object]:
     }
 
 
+def _calibration_with_non_numeric(value: str) -> dict[str, object]:
+    """Build a full calibration body with one named value set to a non-numeric string."""
+    return {
+        section: {name: "x" if name == value else number for name, number in numbers.items()}
+        for section, numbers in NEW_CALIBRATION.items()
+    }
+
+
 def test_node_config_reports_the_node_name(client: TestClient) -> None:
     """Whobot reads each Node's name from the Node itself, not from its own registry."""
     response = client.get("/node/config")
@@ -253,6 +261,11 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
             pytest.param({"json": _calibration_without(value)}, id=f"{value} missing")
             for value in (*NEW_CALIBRATION["polarization_angles"], *NEW_CALIBRATION["reference_rates"])
         ),
+        # Each value set to a non-numeric string in turn: whatever the field, it must arrive as a number.
+        *(
+            pytest.param({"json": _calibration_with_non_numeric(value)}, id=f"{value} non-numeric")
+            for value in (*NEW_CALIBRATION["polarization_angles"], *NEW_CALIBRATION["reference_rates"])
+        ),
         pytest.param(
             {"json": {"polarization_angles": NEW_CALIBRATION["polarization_angles"]}},
             id="reference_rates missing",
@@ -273,21 +286,12 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
         ),
         pytest.param({"json": {}}, id="an empty body"),
         pytest.param({}, id="no body at all"),
-        pytest.param(
-            {
-                "json": {
-                    "polarization_angles": NEW_CALIBRATION["polarization_angles"],
-                    "reference_rates": {"vv": "eleven", "vd": 12.0, "dd": 13.0},
-                }
-            },
-            id="a non-numeric rate",
-        ),
     ],
 )
 def test_put_calibration_refuses_a_body_that_does_not_state_every_value(
     client: TestClient, commented_config: Path, request_kwargs: dict[str, object]
 ) -> None:
-    """Agent decision A4: a PUT states every angle and every rate; anything less, or off-shape, writes nothing."""
+    """Agent decision A4: a PUT states every angle and every rate as a number; anything missing, non-numeric or off-shape writes nothing."""
     before = commented_config.read_text(encoding="utf-8")
     before_angles = settings.polarization_angles.model_copy()
     before_rates = settings.correlation_settings.reference_rates.model_copy()
@@ -344,6 +348,21 @@ def test_put_calibration_round_trips_realistic_values(client: TestClient, commen
     assert _plain_config(commented_config) == {
         **realistic_config,
         "correlation_settings": {"reference_rates": zero_rate["reference_rates"]},
+    }
+
+    # A fractional DD is a value like any other too: Reference rates are floats, and a field typed
+    # as an int would refuse a measured 750.25 outright.
+    fractional_dd = {**zero_rate, "reference_rates": {**zero_rate["reference_rates"], "dd": 750.25}}
+
+    response = client.put("/node/calibration", json=fractional_dd)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == fractional_dd
+    assert client.get("/node/calibration").json() == fractional_dd
+    assert settings.correlation_settings.reference_rates.dd == 750.25  # noqa: PLR2004
+    assert _plain_config(commented_config) == {
+        **realistic_config,
+        "correlation_settings": {"reference_rates": fractional_dd["reference_rates"]},
     }
 
 
