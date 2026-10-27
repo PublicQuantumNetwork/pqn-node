@@ -12,7 +12,7 @@
 | Phase | State | Branch / worktree / PR |
 | --- | --- | --- |
 | 0. Design and workflow | Done (2026-10-27), except installing Node.js for pqn-gui (manual) | `marcosfrenkel/low_entanglement_mode` · `pqn-node/low_entanglement_mode` |
-| 1. Settings and Whobot controls | Not started | `marcosfrenkel/operation_mode_settings` · `pqn-node/operation_mode_settings` |
+| 1. Settings and Whobot controls | Done (2026-10-27) | `marcosfrenkel/operation_mode_settings` · `pqn-node/operation_mode_settings` |
 | 2. Correlation-mode SSM | Not started | `marcosfrenkel/correlation_ssm` · `pqn-node/correlation_ssm` |
 | 3. Unattended SSM and the digest | Not started | `marcosfrenkel/unattended_ssm` · `pqn-node/unattended_ssm` |
 | 4. pqn-gui | Not started | `marcosfrenkel/operation_mode` · `pqn-gui/operation_mode` |
