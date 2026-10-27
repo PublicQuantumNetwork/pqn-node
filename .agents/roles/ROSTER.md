@@ -17,16 +17,23 @@ with" footers, or any line crediting Claude or another AI to a commit message or
 
 | Id | Role file | Runner | Model | Launch command | Role file loaded by runner? |
 |---|---|---|---|---|---|
-| `coder` | `coder.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode --agent coder` | yes |
-| `reviewer-glm` | `reviewer.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode --agent reviewer-glm` | yes |
-| `reviewer-qwen` | `reviewer.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode --agent reviewer-qwen` | yes |
-| `test-reviewer-glm` | `test-reviewer.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode --agent test-reviewer-glm` | yes |
-| `test-reviewer-qwen` | `test-reviewer.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode --agent test-reviewer-qwen` | yes |
-| `plan-checker-glm` | `plan-checker.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode --agent plan-checker-glm` | yes |
-| `plan-checker-qwen` | `plan-checker.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode --agent plan-checker-qwen` | yes |
+| `coder` | `coder.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent coder --model lumen/glm-5.3` | yes |
+| `reviewer-glm` | `reviewer.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent reviewer-glm --model lumen/glm-5.3` | yes |
+| `reviewer-qwen` | `reviewer.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent reviewer-qwen --model lumen/qwen3.8-27b` | yes |
+| `test-reviewer-glm` | `test-reviewer.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent test-reviewer-glm --model lumen/glm-5.3` | yes |
+| `test-reviewer-qwen` | `test-reviewer.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent test-reviewer-qwen --model lumen/qwen3.8-27b` | yes |
+| `plan-checker-glm` | `plan-checker.md` | opencode | lumen/glm-5.3 | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent plan-checker-glm --model lumen/glm-5.3` | yes |
+| `plan-checker-qwen` | `plan-checker.md` | opencode | lumen/qwen3.8-27b | `PYTHONDONTWRITEBYTECODE=1 opencode mini --agent plan-checker-qwen --model lumen/qwen3.8-27b` | yes |
 | `monkey` | `monkey.md` | claude | claude-opus-5-5, effort medium | `ORCH_DIR=<main worktree>/orchestration .agents/roles/bin/monkey-claude.sh` (run in the monkey's own worktree) | yes |
 | `phase-orchestrator` | `.agents/skills/orchestrate-plan/SKILL.md` | claude | opus | `claude --model opus --permission-mode auto --append-system-prompt-file .agents/skills/orchestrate-plan/SKILL.md` | yes |
 | `overall-orchestrator` | `overall-orchestrator.md` | claude | opus | `claude --model opus --permission-mode auto --append-system-prompt-file .agents/roles/overall-orchestrator.md` (started by Marcos) | yes |
+
+**opencode v2.** Since opencode 2.0 (2.0.32 on this machine, 2026-10-27) the default TUI
+rejects `--agent` (`Unrecognized flag: --agent`), so opencode agents launch with `opencode mini
+--agent <id> --model <model>`. `--model` is required: without it the agent runs on
+`Flint 40B Free`. A per-terminal `OPENCODE_CONFIG_CONTENT` `default_agent` does nothing.
+Not yet checked: whether v2 permission prompts still print `Permission required`, which
+`wait-event.sh` looks for.
 
 **Model ids.** Every model id must appear exactly in `opencode models lumen`. The opencode TUI
 does not reject an unknown id: it silently runs its default model instead. `opencode run`
