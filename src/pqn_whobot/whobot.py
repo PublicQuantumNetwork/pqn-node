@@ -91,10 +91,16 @@ from typing import Any
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
+from pqn_node.api.main import Calibration
+from pqn_node.api.main import StatedPolarizationAngles
+from pqn_node.api.main import StatedReferenceRates
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.constants import OperationMode
 from pqn_node.constants import Polarization
 from pqn_node.core.config import GamesAvailability
+from pqn_node.core.config import PolarizationAngles
+from pqn_node.core.config import ReferenceRates
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
 from pqn_whobot.actions import DigestResult
@@ -368,6 +374,117 @@ class Whobot(ABC):
         """
         availability = await self._client(node).get_availability(self.settings.node_timeout_s)
         return dict(availability.model_dump())
+
+    @action(
+        label="Change Operation mode",
+        description="Set which Operation mode a Node plays its two-player Games in: entanglement or correlation.",
+        scope=Scope.ONE,
+    )
+    async def set_operation_mode(
+        self, node: Node, *, operation_mode: OperationMode = OperationMode.ENTANGLEMENT
+    ) -> Report:
+        """Set the Operation mode a Node plays its two-player Games in, then report what the Node says afterwards.
+
+        One dropdown of the two modes, so the form cannot ask for one that does not exist.
+        """
+        try:
+            applied = await self._client(node).set_operation_mode(operation_mode, self.settings.node_timeout_s)
+        except NodeApiError as e:
+            return Report(
+                status=Status.FAIL,
+                title=f"Operation mode — {node.name}",
+                summary="The Node did not answer.",
+                sections=[Section(error=str(e))],
+            )
+
+        return Report(
+            status=Status.OK,
+            title=f"Operation mode — {node.name}",
+            summary=f"{node.name} now plays its two-player Games in {applied.value} mode.",
+            sections=[Section(fields=[Field(name="Operation mode", value=applied.value)])],
+            notes=["The mode is saved to the Node's config and applied without a restart."],
+        )
+
+    @prefill(set_operation_mode)
+    async def _operation_mode_prefill(self, node: Node) -> dict[str, object]:
+        """Open the form on the mode the Node currently plays in."""
+        mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+        return {"operation_mode": mode}
+
+    @action(
+        label="Change calibration",
+        description="Set a Node's Calibrated angles and Reference rates.",
+        scope=Scope.ONE,
+    )
+    # One form field per value the Node stores: four angle floats and three rate floats (decision 16).
+    async def set_calibration(  # noqa: PLR0913 - the form asks for every value, one field each
+        self,
+        node: Node,
+        *,
+        h: float = PolarizationAngles().h,
+        v: float = PolarizationAngles().v,
+        d: float = PolarizationAngles().d,
+        a: float = PolarizationAngles().a,
+        vv: float = ReferenceRates().vv,
+        vd: float = ReferenceRates().vd,
+        dd: float = ReferenceRates().dd,
+    ) -> Report:
+        """Set the Calibrated angles and Reference rates a Node plays with, then report what the Node says afterwards.
+
+        The parameters are named as the Node's own models name them, so the prefill and
+        the form agree without either naming the values a second time. The Node takes the
+        whole calibration at once — it refuses a partial change — so every value is sent
+        every time.
+        """
+        calibration = Calibration(
+            polarization_angles=StatedPolarizationAngles(h=h, v=v, d=d, a=a),
+            reference_rates=StatedReferenceRates(vv=vv, vd=vd, dd=dd),
+        )
+        try:
+            applied = await self._client(node).set_calibration(calibration, self.settings.node_timeout_s)
+        except NodeApiError as e:
+            return Report(
+                status=Status.FAIL,
+                title=f"Calibration — {node.name}",
+                summary="The Node did not answer.",
+                sections=[Section(error=str(e))],
+            )
+
+        angles, rates = applied.polarization_angles, applied.reference_rates
+        return Report(
+            status=Status.OK,
+            title=f"Calibration — {node.name}",
+            sections=[
+                Section(
+                    label="Calibrated angles",
+                    fields=[
+                        Field(name="H", value=f"{angles.h:g}°"),
+                        Field(name="V", value=f"{angles.v:g}°"),
+                        Field(name="D", value=f"{angles.d:g}°"),
+                        Field(name="A", value=f"{angles.a:g}°"),
+                    ],
+                ),
+                Section(
+                    label="Reference rates",
+                    fields=[
+                        Field(name="VV", value=f"{rates.vv:g} coincidences/s"),
+                        Field(name="VD", value=f"{rates.vd:g} coincidences/s"),
+                        Field(name="DD", value=f"{rates.dd:g} coincidences/s"),
+                    ],
+                ),
+            ],
+            notes=["The calibration is saved to the Node's config and applied without a restart."],
+        )
+
+    @prefill(set_calibration)
+    async def _calibration_prefill(self, node: Node) -> dict[str, object]:
+        """Open the form on the calibration the Node currently plays with.
+
+        ``model_dump`` keys this by value name, which is what the form asks for, and is
+        what keeps this method from naming the values itself.
+        """
+        calibration = await self._client(node).get_calibration(self.settings.node_timeout_s)
+        return {**calibration.polarization_angles.model_dump(), **calibration.reference_rates.model_dump()}
 
     @action(
         label="Run CHSH",

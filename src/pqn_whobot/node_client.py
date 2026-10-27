@@ -15,9 +15,11 @@ import httpx
 from pydantic import BaseModel
 from pydantic import ValidationError
 
+from pqn_node.api.main import Calibration
 from pqn_node.api.routes.chsh import ChshResult
 from pqn_node.api.routes.chsh import SweepResult
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.constants import OperationMode
 from pqn_node.core.config import GamesAvailability
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,50 @@ class NodeClient:
         """
         payload = await self._send_json("PUT", "/games/availability", timeout_s, availability.model_dump())
         return self._parse_availability(payload)
+
+    def _parse_operation_mode(self, payload: object) -> OperationMode:
+        """Parse the mode's own string, refusing an answer that carries anything else."""
+        if not isinstance(payload, str):
+            msg = f"{self.api_url}/node/operation_mode is not an Operation mode: {str(payload)[:100]}"
+            raise NodeApiError(msg)
+        try:
+            return OperationMode(payload)
+        except ValueError as e:
+            msg = f"{self.api_url}/node/operation_mode did not answer with an Operation mode: {payload[:100]}"
+            raise NodeApiError(msg) from e
+
+    async def get_operation_mode(self, timeout_s: float) -> OperationMode:
+        """Ask the Node which Operation mode it plays its two-player Games in.
+
+        The endpoint answers with the mode's own string and nothing else, so a string the
+        enum does not know is a Node running other code rather than a mode to guess at.
+        """
+        return self._parse_operation_mode(await self._send_json("GET", "/node/operation_mode", timeout_s))
+
+    async def set_operation_mode(self, mode: OperationMode, timeout_s: float) -> OperationMode:
+        """Set the Node's Operation mode, persistently and without a restart.
+
+        Returns what the Node reports *afterwards*, which is the mode it will play its
+        next two-player Game in.
+        """
+        payload = await self._send_json("PUT", "/node/operation_mode", timeout_s, mode.value)
+        return self._parse_operation_mode(payload)
+
+    async def get_calibration(self, timeout_s: float) -> Calibration:
+        """Ask the Node for the Calibrated angles and Reference rates it plays with."""
+        payload = await self._send_json("GET", "/node/calibration", timeout_s)
+        return self._validated(Calibration, payload, "a calibration")
+
+    async def set_calibration(self, calibration: Calibration, timeout_s: float) -> Calibration:
+        """Set the Node's Calibrated angles and Reference rates, persistently and without a restart.
+
+        The body states the whole calibration, because the Node refuses a partial one: a
+        value left out would reset that angle or rate to its default, and a calibration
+        changed by accident is exactly what keeping this apart from Change Operation mode
+        avoids.
+        """
+        payload = await self._send_json("PUT", "/node/calibration", timeout_s, calibration.model_dump())
+        return self._validated(Calibration, payload, "a calibration")
 
     async def get_screenshot(self, timeout_s: float) -> bytes:
         """Capture the Node's display, returning the image bytes as they arrived.

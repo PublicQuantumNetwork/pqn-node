@@ -34,7 +34,10 @@ import pytest
 from pydantic import ValidationError
 
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.constants import OperationMode
 from pqn_node.core.config import GamesAvailability
+from pqn_node.core.config import PolarizationAngles
+from pqn_node.core.config import ReferenceRates
 from pqn_whobot.actions import DEFAULT_TIMEOUT_S
 from pqn_whobot.actions import Action
 from pqn_whobot.actions import ActionResult
@@ -625,6 +628,168 @@ def test_the_form_asks_about_every_game() -> None:
     """
     asked = {parameter.name for parameter in WhobotSpy.actions["set_availability"].parameters}
     assert asked == set(GamesAvailability.model_fields)
+
+
+# --------------------------------------------------------------------------------------
+# Change Operation mode and Change calibration, against a mocked Node API.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_operation_mode_form_is_a_dropdown_of_the_two_modes() -> None:
+    """Decision 16: an enum dropdown, so the form cannot ask for a mode that does not exist."""
+    parameter = WhobotSpy.actions["set_operation_mode"].parameters[0]
+
+    assert parameter.annotation is OperationMode
+    assert parameter.default is OperationMode.ENTANGLEMENT
+
+
+def test_the_operation_mode_form_opens_on_the_nodes_mode() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json="correlation")
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="set_operation_mode", node_url=ALICE)))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert [(request.method, request.url.path) for request in seen] == [("GET", "/node/operation_mode")]
+    assert bot.drawn.initial == {"operation_mode": OperationMode.CORRELATION}
+
+
+def test_changing_the_operation_mode_sends_the_modes_own_string() -> None:
+    """Decision 8: the API carries the mode's own string, so the body is that and nothing else."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json="correlation")
+
+    bot = with_node_api(handler, ALICE)
+    pending = PendingInvocation(action="set_operation_mode", node_url=ALICE, params={"operation_mode": "correlation"})
+    asyncio.run(dispatched(bot, pending))
+
+    request = next(r for r in seen if r.url.path == "/node/operation_mode")
+    assert request.method == "PUT"
+    assert json.loads(request.content) == "correlation"
+    result = only_report(bot)
+    assert result.status is Status.OK
+    assert result.sections[0].fields[0].value == "correlation"
+
+
+def test_a_node_that_refuses_the_mode_change_is_a_fail_with_its_reason() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(503, json={"detail": "the config file is read-only"})
+
+    bot = with_node_api(handler, ALICE)
+    pending = PendingInvocation(action="set_operation_mode", node_url=ALICE, params={"operation_mode": "correlation"})
+    asyncio.run(dispatched(bot, pending))
+
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert "read-only" in (result.sections[0].error or "")
+
+
+def test_the_calibration_form_asks_for_every_angle_and_every_rate() -> None:
+    """Decision 16: four angle floats and three rate floats, named as the Node's models name them."""
+    asked = [parameter.name for parameter in WhobotSpy.actions["set_calibration"].parameters]
+
+    assert asked == [*PolarizationAngles.model_fields, *ReferenceRates.model_fields]
+
+
+# Unlike any default, so a prefill test passing on defaults can never pass for reading the Node.
+NODE_CALIBRATION = {
+    "polarization_angles": {"h": 10.0, "v": 20.0, "d": 30.0, "a": 40.0},
+    "reference_rates": {"vv": 2100.0, "vd": 1400.0, "dd": 700.0},
+}
+NODE_CALIBRATION_FORM: dict[str, object] = {
+    "h": 10.0,
+    "v": 20.0,
+    "d": 30.0,
+    "a": 40.0,
+    "vv": 2100.0,
+    "vd": 1400.0,
+    "dd": 700.0,
+}
+
+NEW_CALIBRATION = {
+    "polarization_angles": {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5},
+    "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
+}
+NEW_CALIBRATION_FORM: dict[str, object] = {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5, "vv": 11.0, "vd": 12.0, "dd": 13.0}
+
+
+def test_the_calibration_form_opens_on_the_nodes_calibration() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=NODE_CALIBRATION)
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="set_calibration", node_url=ALICE)))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert [(request.method, request.url.path) for request in seen] == [("GET", "/node/calibration")]
+    assert bot.drawn.initial == NODE_CALIBRATION_FORM
+
+
+def test_the_calibration_form_falls_back_on_a_fresh_nodes_values() -> None:
+    """A prefill that cannot read the Node still opens the form, on the values a Node with no keys set plays with."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(503, json={"detail": "down for maintenance"})
+
+    bot = with_node_api(handler, ALICE)
+    asyncio.run(dispatched(bot, PendingInvocation(action="set_calibration", node_url=ALICE)))
+
+    assert bot.drawn.calls == ["ask_for_params"]
+    assert bot.drawn.initial == {"h": 0.0, "v": 45.0, "d": 22.5, "a": -22.5, "vv": 3000.0, "vd": 1500.0, "dd": 750.0}
+
+
+def test_changing_the_calibration_sends_every_value_to_the_node() -> None:
+    """The Node refuses a partial calibration, so the Action states the whole of it every time."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=NEW_CALIBRATION)
+
+    bot = with_node_api(handler, ALICE)
+    pending = PendingInvocation(action="set_calibration", node_url=ALICE, params=NEW_CALIBRATION_FORM)
+    asyncio.run(dispatched(bot, pending))
+
+    request = next(r for r in seen if r.url.path == "/node/calibration")
+    assert request.method == "PUT"
+    assert json.loads(request.content) == NEW_CALIBRATION
+    result = only_report(bot)
+    assert result.status is Status.OK
+    sections = {section.label: section for section in result.sections}
+    assert {f.name: f.value for f in sections["Calibrated angles"].fields} == {
+        "H": "1.5°",
+        "V": "2.5°",
+        "D": "3.5°",
+        "A": "4.5°",
+    }
+    assert {f.name: f.value for f in sections["Reference rates"].fields} == {
+        "VV": "11 coincidences/s",
+        "VD": "12 coincidences/s",
+        "DD": "13 coincidences/s",
+    }
+
+
+def test_a_node_that_refuses_the_calibration_is_a_fail_with_its_reason() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(422, json={"detail": "polarization_angles.v: Field required"})
+
+    bot = with_node_api(handler, ALICE)
+    pending = PendingInvocation(action="set_calibration", node_url=ALICE, params=NEW_CALIBRATION_FORM)
+    asyncio.run(dispatched(bot, pending))
+
+    result = only_report(bot)
+    assert result.status is Status.FAIL
+    assert "Field required" in (result.sections[0].error or "")
 
 
 # --------------------------------------------------------------------------------------
