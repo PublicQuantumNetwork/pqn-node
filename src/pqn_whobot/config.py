@@ -27,6 +27,12 @@ from pqn_node.core.config import write_config
 DEFAULT_BASIS: tuple[float, float] = (0.0, 22.5)
 """The CHSH angles the digest measures at, and that "Run CHSH" falls back to when a field is cleared."""
 
+DEFAULT_SSM_QUESTIONS = 8
+"""How many questions the unattended SSM check asks, both by hand and in the digest (decision 13)."""
+
+DEFAULT_SSM_MAX_ERROR_RATE = 0.15
+"""The worst per-basis bit error rate the unattended SSM check calls OK (decision 13)."""
+
 
 class ConfigWriteError(ValueError):
     """A write to ``whobot.toml`` was rolled back because the result would not load."""
@@ -70,6 +76,12 @@ class WhobotSettings(BaseSettings):
     # means each Node's own host and one value serves the fleet; the port is the Node API's.
     timetagger_address: str = "127.0.0.1:9000"
     basis: tuple[float, float] = DEFAULT_BASIS
+
+    # How the unattended Share a Secret Message check is set up (decision 13). Both are the
+    # digest's defaults and the starting point of the Run SSM form; nothing reads them until a
+    # check runs, so a fresh config behaves exactly as today.
+    ssm_questions: int = Field(default=DEFAULT_SSM_QUESTIONS, gt=0)
+    ssm_max_error_rate: float = Field(default=DEFAULT_SSM_MAX_ERROR_RATE, ge=0.0, le=1.0)
 
     # How long one Game may take. The digest's per-Node and whole-run bounds are derived from
     # this rather than configured beside it, so no two keys can disagree about the same wait.

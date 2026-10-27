@@ -19,8 +19,14 @@ from pqn_node.api.main import Calibration
 from pqn_node.api.routes.chsh import ChshResult
 from pqn_node.api.routes.chsh import SweepResult
 from pqn_node.api.routes.health import HealthStatus
+from pqn_node.api.routes.qkd import UnattendedCorrelationResult
+from pqn_node.api.routes.qkd import UnattendedEntanglementResult
+from pqn_node.api.routes.qkd import UnattendedQKDAnswers
 from pqn_node.constants import OperationMode
 from pqn_node.core.config import GamesAvailability
+
+UnattendedSsmResult = UnattendedEntanglementResult | UnattendedCorrelationResult
+"""What one unattended SSM game returns, discriminated by its ``mode`` field (decision 13)."""
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +264,39 @@ class NodeClient:
         params = {"timetagger_address": timetagger_address}
         payload = await self._send_json("POST", "/chsh/", timeout_s, list(basis), params)
         return self._validated(ChshResult, payload, "a CHSH result")
+
+    async def run_ssm(
+        self,
+        answers: UnattendedQKDAnswers,
+        timetagger_address: str,
+        timeout_s: float,
+        integration_time_s: float | None = None,
+    ) -> UnattendedSsmResult:
+        """Play one unattended SSM game on this Node as leader, with both players' Answers.
+
+        The leader puts its configured follower in the follower role itself, so the caller
+        names only the leader (decision 15). ``integration_time_s`` is omitted when the caller
+        has none: the Node then measures as its GUI game does (agent decision A9).
+        """
+        params = {"timetagger_address": timetagger_address}
+        if integration_time_s is not None:
+            params["integration_time_s"] = str(integration_time_s)
+        payload = await self._send_json("POST", "/qkd/unattended", timeout_s, answers.model_dump(), params)
+        return self._parse_ssm(payload)
+
+    def _parse_ssm(self, payload: object) -> UnattendedSsmResult:
+        """Parse an unattended SSM result by its ``mode`` field, refusing an answer without one.
+
+        The two modes return different shapes, so the mode is the only thing that says which
+        model to read; a body without it is something other than a Node answering.
+        """
+        mode = payload.get("mode") if isinstance(payload, dict) else None
+        if mode == OperationMode.ENTANGLEMENT:
+            return self._validated(UnattendedEntanglementResult, payload, "an unattended SSM result")
+        if mode == OperationMode.CORRELATION:
+            return self._validated(UnattendedCorrelationResult, payload, "an unattended SSM result")
+        msg = f"{self.api_url}/qkd/unattended is not an unattended SSM result: {str(payload)[:100]}"
+        raise NodeApiError(msg)
 
     async def run_sweep(
         self,

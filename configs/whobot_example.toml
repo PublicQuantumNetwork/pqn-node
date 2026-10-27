@@ -53,6 +53,12 @@ basis = [0.0, 22.5]
 # about the same wait.
 per_game_timeout_s = 600
 
+# The unattended Share a Secret Message check: how many questions it asks and the worst bit
+# error rate per basis it calls OK. Both are the digest's defaults and the starting point of
+# the Run SSM form, which an operator can change field by field.
+ssm_questions = 8
+ssm_max_error_rate = 0.15
+
 # How long a mere "are you there?" call waits. Far shorter than the digest budget, so
 # `whobot nodes` reports a dead address in seconds instead of appearing to hang.
 reachability_timeout_s = 5

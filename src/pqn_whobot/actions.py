@@ -209,16 +209,16 @@ Resolved by ``Action.timeout_for`` at call time, which is the only moment the nu
 the scan stores the declaration and never looks inside it.
 """
 
-WIDGET_TYPES: tuple[type, ...] = (bool, float, int)
+WIDGET_TYPES: tuple[type, ...] = (bool, float, int, str)
 """Parameter types the form generator can render: ``bool`` a checkbox, ``float`` and ``int`` a
-number input — which for an ``int`` refuses decimals, since an hour of the day has none.
+number input — which for an ``int`` refuses decimals, since an hour of the day has none — and
+``str`` a single-line text field, for free text such as a string of Answers.
 
 Any ``Enum`` subclass is accepted besides these and rendered as a dropdown of its members (see
 ``is_choice``); an enum is a family of types rather than one, so it cannot be an entry here.
 
 The scan rejects any other type by name, so an unsupported parameter fails at import with a
-message rather than producing an empty form. Adding ``str`` is one entry here and one branch
-in the Chat Platform's form renderer.
+message rather than producing an empty form.
 """
 
 
