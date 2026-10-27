@@ -15,7 +15,7 @@
 | 1. Settings and Whobot controls | Done (2026-10-27) | `marcosfrenkel/operation_mode_settings` · `pqn-node/operation_mode_settings` |
 | 2. Correlation-mode SSM | Done (2026-10-27) | `marcosfrenkel/correlation_ssm` · `pqn-node/correlation_ssm` |
 | 3. Unattended SSM and the digest | Done (2026-10-27) | `marcosfrenkel/unattended_ssm` · `pqn-node/unattended_ssm` |
-| 4. pqn-gui | Not started | `marcosfrenkel/operation_mode` · `pqn-gui/operation_mode` |
+| 4. pqn-gui | Done (2026-10-27), except Marcos's visual check of both modes (manual) | `marcosfrenkel/operation_mode` · `pqn-gui/operation_mode` |
 | 5. Deploy and lab check | Not started | — |
 
 Worktrees are under `/home/marcosf2/orca/workspaces/`. Each pqn-node branch is based on the previous phase's branch.
