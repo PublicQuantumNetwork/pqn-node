@@ -174,3 +174,7 @@ whobot.toml
 
 # Every Angle Sweep Whobot has run, kept beside its config.
 whobot_sweeps.csv
+
+# Agent workflow (see .agents/) and Orca local files
+orchestration/
+.orca/
