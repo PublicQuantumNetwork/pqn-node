@@ -775,14 +775,23 @@ NODE_CALIBRATION_FORM: dict[str, object] = {
     "dd": 700.0,
 }
 
-# What the operator submits, and what the Node answers the PUT with: different in every
-# value, and carrying 2+ decimals each, so the report test catches both a report of what
-# was asked for and any rounding on the way out.
+# What the operator submits and what the Node answers the PUT with: different in every
+# value, and fractional in every field on both sides — so the body test catches a form
+# field that truncates what was typed (an int annotation where a float belongs), and the
+# report test catches a report of what was asked for and any rounding on the way out.
 NEW_CALIBRATION = {
-    "polarization_angles": {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5},
-    "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
+    "polarization_angles": {"h": 1.25, "v": 2.5, "d": 3.75, "a": 4.25},
+    "reference_rates": {"vv": 11.5, "vd": 12.25, "dd": 13.75},
 }
-NEW_CALIBRATION_FORM: dict[str, object] = {"h": 1.5, "v": 2.5, "d": 3.5, "a": 4.5, "vv": 11.0, "vd": 12.0, "dd": 13.0}
+NEW_CALIBRATION_FORM: dict[str, object] = {
+    "h": 1.25,
+    "v": 2.5,
+    "d": 3.75,
+    "a": 4.25,
+    "vv": 11.5,
+    "vd": 12.25,
+    "dd": 13.75,
+}
 ANSWERED_CALIBRATION = {
     "polarization_angles": {"h": 0.25, "v": 22.25, "d": 44.75, "a": -11.05},
     "reference_rates": {"vv": 2999.25, "vd": 1499.75, "dd": 749.05},
