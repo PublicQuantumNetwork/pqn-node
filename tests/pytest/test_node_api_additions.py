@@ -47,6 +47,22 @@ NEW_CALIBRATION = {
     "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
 }
 
+# The values a real calibration carries: A's angle is negative even at its default (-22.5), H back
+# to zero, a fractional D, an angle above 90, DD back to its default rate, fractional rates. The
+# negative and >1e6 rates are not physics; they pin that the Node stores exactly what it was given.
+REALISTIC_CALIBRATION = {
+    "polarization_angles": {"h": 0.0, "v": 112.5, "d": -21.37, "a": -22.5},
+    "reference_rates": {"vv": 1234567.89, "vd": -13.5, "dd": 750.0},
+}
+
+# What a PUT leaves in config.toml when it started from COMMENTED_CONFIG: the operator's own keys,
+# unchanged, plus exactly the keys the endpoint writes.
+BASE_CONFIG = {
+    "node_name": "example_node",
+    "router_name": "router1",
+    "games_availability": {"qf": True},
+}
+
 
 @pytest.fixture
 def client() -> TestClient:
@@ -81,6 +97,11 @@ def commented_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.toml"
     path.write_text(COMMENTED_CONFIG, encoding="utf-8")
     return path
+
+
+def _plain_config(path: Path) -> dict[str, object]:
+    """Read config.toml as a plain dict, so one exact comparison catches changed, dropped and added keys."""
+    return dict(tomlkit.parse(path.read_text(encoding="utf-8")).unwrap())
 
 
 def test_node_config_reports_the_node_name(client: TestClient) -> None:
@@ -153,14 +174,37 @@ def test_put_operation_mode_is_visible_to_get_without_a_restart(client: TestClie
     assert client.get("/node/operation_mode").json() == "correlation"
 
 
-def test_put_operation_mode_refuses_a_mode_the_node_does_not_know(client: TestClient) -> None:
-    """Decision 8: only "entanglement" and "correlation" are Operation modes, so nothing else is written."""
-    before = settings.operation_mode
+def test_put_operation_mode_switches_to_correlation_and_back(client: TestClient, commented_config: Path) -> None:
+    """A Node switched to correlation must be switchable back to entanglement, writing nothing else."""
+    for mode in (OperationMode.CORRELATION, OperationMode.ENTANGLEMENT):
+        response = client.put("/node/operation_mode", json=mode.value)
 
-    response = client.put("/node/operation_mode", json="quantum")
+        assert response.status_code == HTTPStatus.OK
+        assert response.json() == mode.value
+        assert settings.operation_mode is mode
+        assert client.get("/node/operation_mode").json() == mode.value
+        assert _plain_config(commented_config) == {**BASE_CONFIG, "operation_mode": mode.value}
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        pytest.param({"json": "quantum"}, id="an unknown mode"),
+        pytest.param({"content": "null", "headers": {"content-type": "application/json"}}, id="a null body"),
+    ],
+)
+def test_put_operation_mode_refusals_write_nothing(
+    client: TestClient, commented_config: Path, request_kwargs: dict[str, object]
+) -> None:
+    """Decision 8: only "entanglement" and "correlation" are Operation modes, and a refusal writes nothing."""
+    before = commented_config.read_text(encoding="utf-8")
+    before_mode = settings.operation_mode
+
+    response = client.put("/node/operation_mode", **request_kwargs)
 
     assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
-    assert settings.operation_mode is before
+    assert settings.operation_mode is before_mode
+    assert commented_config.read_text(encoding="utf-8") == before
 
 
 def test_get_calibration_reports_the_nodes_calibration(client: TestClient) -> None:
@@ -191,6 +235,84 @@ def test_put_calibration_persists_and_applies(client: TestClient, commented_conf
     document = tomlkit.parse(written)
     assert dict(document["polarization_angles"]) == NEW_CALIBRATION["polarization_angles"]
     assert dict(document["correlation_settings"]["reference_rates"]) == NEW_CALIBRATION["reference_rates"]
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        pytest.param(
+            {
+                "json": {
+                    "polarization_angles": {"h": 1.5, "v": 2.5, "d": 3.5},  # a is missing
+                    "reference_rates": {"vv": 11.0, "vd": 12.0, "dd": 13.0},
+                }
+            },
+            id="an angle missing",
+        ),
+        pytest.param(
+            {"json": {"polarization_angles": NEW_CALIBRATION["polarization_angles"]}}, id="reference_rates missing"
+        ),
+        pytest.param(
+            {"json": {"reference_rates": NEW_CALIBRATION["reference_rates"]}}, id="polarization_angles missing"
+        ),
+        pytest.param({"json": {}}, id="an empty body"),
+        pytest.param({}, id="no body at all"),
+        pytest.param(
+            {
+                "json": {
+                    "polarization_angles": NEW_CALIBRATION["polarization_angles"],
+                    "reference_rates": {"vv": "eleven", "vd": 12.0, "dd": 13.0},
+                }
+            },
+            id="a non-numeric rate",
+        ),
+    ],
+)
+def test_put_calibration_refuses_an_incomplete_body(
+    client: TestClient, commented_config: Path, request_kwargs: dict[str, object]
+) -> None:
+    """Agent decision A4: a PUT states the whole calibration; anything less is a 422 that writes nothing."""
+    before = commented_config.read_text(encoding="utf-8")
+    before_angles = settings.polarization_angles.model_copy()
+    before_rates = settings.correlation_settings.reference_rates.model_copy()
+
+    response = client.put("/node/calibration", **request_kwargs)
+
+    assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert commented_config.read_text(encoding="utf-8") == before
+    assert settings.polarization_angles == before_angles
+    assert settings.correlation_settings.reference_rates == before_rates
+
+
+def test_put_calibration_round_trips_realistic_values(client: TestClient, commented_config: Path) -> None:
+    """Round-trip the values a real calibration carries: negative, zero, fractional, above 90, and defaults.
+
+    A's Calibrated angle is negative even at its default, rates are fractional in the wild, and an
+    operator puts a value back to its default after tuning — so no value may be dropped, clamped,
+    rounded or sign-flipped on its way into config.toml or back out of GET, and no other key may
+    appear in the file. Every GET runs while the Node is in correlation mode, the mode the
+    calibration serves.
+    """
+    assert client.put("/node/operation_mode", json="correlation").status_code == HTTPStatus.OK
+    # Every value off its default, so the realistic values that follow are genuine changes.
+    assert client.put("/node/calibration", json=NEW_CALIBRATION).status_code == HTTPStatus.OK
+    assert client.get("/node/calibration").json() == NEW_CALIBRATION
+
+    response = client.put("/node/calibration", json=REALISTIC_CALIBRATION)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == REALISTIC_CALIBRATION
+    assert client.get("/node/calibration").json() == REALISTIC_CALIBRATION
+    assert settings.polarization_angles == PolarizationAngles(**REALISTIC_CALIBRATION["polarization_angles"])
+    assert settings.correlation_settings.reference_rates == ReferenceRates(**REALISTIC_CALIBRATION["reference_rates"])
+    written = commented_config.read_text(encoding="utf-8")
+    assert "qf = true  # Quantum Fortune" in written  # the operator's comments survive the write
+    assert _plain_config(commented_config) == {
+        **BASE_CONFIG,
+        "operation_mode": "correlation",
+        "polarization_angles": REALISTIC_CALIBRATION["polarization_angles"],
+        "correlation_settings": {"reference_rates": REALISTIC_CALIBRATION["reference_rates"]},
+    }
 
 
 def test_put_calibration_is_visible_to_get_without_a_restart(client: TestClient) -> None:
