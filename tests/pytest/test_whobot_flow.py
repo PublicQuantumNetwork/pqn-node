@@ -59,6 +59,7 @@ from pqn_whobot.config import update_config
 from pqn_whobot.node_client import NodeClient
 from pqn_whobot.registry import Node
 from pqn_whobot.whobot import GAME_TITLES
+from pqn_whobot.whobot import OPERATION_MODE_LABEL
 from pqn_whobot.whobot import Whobot
 from pqn_whobot.whobot import _bell_verdict
 from pqn_whobot.whobot import _hardware_section
@@ -1288,13 +1289,25 @@ SWEEP = {
 ALL_GAMES_ON = {"chsh": True, "qf": True, "ssm": True}
 
 
-def node_api(
+def node_api(  # noqa: PLR0913 - one keyword per endpoint a check-up can hit, so a test sets one
     *,
     availability: object = ALL_GAMES_ON,
     refuse: dict[str, int] | None = None,
     seen: list[httpx.Request] | None = None,
+    mode: str = "entanglement",
+    follower: str | None = None,
+    follower_mode: str = "correlation",
+    follower_refuses: bool = False,
+    unattended: object = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Answer every endpoint a check-up calls, with any of them able to refuse instead."""
+    """Answer every endpoint a check-up calls, with any of them able to refuse instead.
+
+    ``follower`` is the address ``/node/config`` reports, and is ``None`` by default — no
+    follower configured, so the digest reads no follower mode. A request whose host is that
+    follower is answered with ``follower_mode``, so a mismatch can be set up, or refused by
+    connection when ``follower_refuses`` is set, for a follower that cannot be read. ``unattended``
+    is the SSM game's answer; the default is a clean entanglement-mode game over eight questions.
+    """
     refusals = refuse or {}
     answers: dict[str, object] = {
         "/health/": HEALTHY,
@@ -1302,12 +1315,21 @@ def node_api(
         "/chsh/": CHSH,
         "/chsh/sweep": SWEEP,
         "/rng/fortune": [42, 137],
+        "/node/operation_mode": mode,
+        "/node/config": {"node_name": "uiuc-public-left", "follower_node_address": follower},
+        "/qkd/unattended": unattended if unattended is not None else entangled([0] * 8, [0] * 8),
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
             seen.append(request)
         path = request.url.path
+        is_follower = follower is not None and request.url.host == follower
+        if is_follower and follower_refuses:
+            msg = f"{follower} is not answering"
+            raise httpx.ConnectError(msg, request=request)
+        if is_follower and path == "/node/operation_mode":
+            return httpx.Response(200, json=follower_mode)
         if path in refusals:
             return httpx.Response(refusals[path], json={"detail": f"{path} is not having it"})
         if path not in answers:
@@ -1384,22 +1406,145 @@ def test_an_unviolated_bell_inequality_warns_rather_than_fails() -> None:
 # --- one Node's whole check-up ---
 
 
-def test_a_healthy_node_reports_its_hardware_and_both_games() -> None:
+def test_a_healthy_node_reports_its_hardware_its_mode_and_every_game() -> None:
     digest = checked(with_node_api(node_api(), ALICE))
 
     assert digest.status is Status.OK
-    assert list(sections_of(digest)) == ["Hardware", *GAME_TITLES.values()]
+    assert list(sections_of(digest)) == ["Hardware", OPERATION_MODE_LABEL, *GAME_TITLES.values()]
     chsh = sections_of(digest)[GAME_TITLES["chsh"]]
     assert next(f.value for f in chsh.fields if f.name == "S") == "2.6135 ± 0.0400"
     assert chsh.note is not None, "a Game reports how long it took"
 
 
-def test_ssm_is_always_skipped_and_says_why() -> None:
-    """It needs an interactive coordination dance, so no unattended run can play it."""
+def test_the_ssm_section_is_played_when_the_node_offers_it() -> None:
+    """An unattended run can play SSM now (decision 10), so the digest does."""
     ssm = sections_of(checked(with_node_api(node_api(), ALICE)))[GAME_TITLES["ssm"]]
 
+    assert ssm.status is Status.OK
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "entanglement"
+
+
+def test_an_ssm_section_the_node_does_not_offer_is_skipped_like_the_other_games() -> None:
+    """A Game switched off on purpose is skipped, with the same wording as CHSH and QF."""
+    digest = checked(with_node_api(node_api(availability={"chsh": True, "qf": True, "ssm": False}), ALICE))
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
     assert ssm.status is Status.SKIPPED
-    assert "coordination dance" in ssm.fields[0].value
+    assert ssm.fields[0].value == "Not available on this Node."
+    assert digest.status is Status.OK, "a Game switched off on purpose is not bad news"
+
+
+# --- the Operation mode section: each Node's mode, and its follower's (decision 9, A13) ---
+
+
+def test_every_node_reports_its_operation_mode() -> None:
+    """The mode is a Node-level fact, reported whatever Games it offers and in both modes."""
+    entanglement = sections_of(checked(with_node_api(node_api(mode="entanglement"), ALICE)))
+    correlation = sections_of(checked(with_node_api(node_api(mode="correlation"), ALICE)))
+
+    assert {field.name: field.value for field in entanglement[OPERATION_MODE_LABEL].fields}["Operation mode"] == (
+        "entanglement"
+    )
+    assert {field.name: field.value for field in correlation[OPERATION_MODE_LABEL].fields}["Operation mode"] == (
+        "correlation"
+    )
+
+
+def test_the_mode_is_reported_even_when_the_node_offers_no_games() -> None:
+    """Decision 9: the mode changes what the GUI tells CHSH players too, so it is always read."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(availability={"chsh": False, "qf": False, "ssm": False}, seen=seen), ALICE))
+
+    assert sections_of(digest)[OPERATION_MODE_LABEL].status is Status.OK
+    assert "/node/operation_mode" in [request.url.path for request in seen]
+
+
+def test_the_mode_read_is_reused_by_the_ssm_section() -> None:
+    """The mode is read once per Node, and the SSM section is handed what was already read."""
+    seen: list[httpx.Request] = []
+    checked(with_node_api(node_api(seen=seen), ALICE))
+
+    reads = [request for request in seen if request.url.path == "/node/operation_mode"]
+    assert len(reads) == 1, "the mode is read once and reused for the SSM report"
+
+
+def test_a_node_whose_own_mode_cannot_be_read_warns_and_still_plays_ssm() -> None:
+    """A mode read that fails is a WARN on the mode section, not a lost check-up."""
+    digest = checked(with_node_api(node_api(refuse={"/node/operation_mode": 503}), ALICE))
+
+    mode_section = sections_of(digest)[OPERATION_MODE_LABEL]
+    assert mode_section.status is Status.WARN
+    assert mode_section.error is not None
+    # The SSM section reads the mode itself, so its own status still follows the game.
+    assert sections_of(digest)[GAME_TITLES["ssm"]].status is Status.FAIL
+
+
+def test_a_matching_follower_mode_is_shown_without_a_warning() -> None:
+    """Decision 9: only a *difference* is a mistake worth flagging."""
+    digest = checked(with_node_api(node_api(mode="correlation", follower="10.0.0.9"), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "correlation"
+    assert section.status is Status.OK
+
+
+def test_a_follower_in_a_different_mode_warns_and_names_both() -> None:
+    """A mismatch is an operator mistake; the flag names both modes so it can be fixed."""
+    digest = checked(with_node_api(node_api(mode="entanglement", follower="10.0.0.9"), ALICE, node_timeout_s=0.5))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.WARN
+    assert "correlation" in follower.value
+    assert "entanglement" in follower.value
+    assert section.status is Status.WARN
+
+
+def test_a_follower_mode_that_cannot_be_read_shows_unknown_and_warns() -> None:
+    """A13: an unreadable follower must WARN, so a mismatch is never hidden."""
+    digest = checked(with_node_api(node_api(follower="down.invalid", follower_refuses=True), ALICE, node_timeout_s=0.5))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.WARN
+    assert follower.value.startswith("unknown")
+    assert section.status is Status.WARN
+
+
+def test_no_configured_follower_is_said_without_a_warning() -> None:
+    """A13: no follower configured means no flag — and no follower mode is even asked for."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(follower=None, seen=seen), ALICE))
+
+    section = sections_of(digest)[OPERATION_MODE_LABEL]
+    follower = next(field for field in section.fields if field.name == "Follower mode")
+    assert follower.status is Status.OK
+    assert follower.value == "none configured"
+    assert section.status is Status.OK
+    assert [request.url.path for request in seen].count("/node/config") == 1
+
+
+def test_the_digests_ssm_check_follows_the_nodes_mode() -> None:
+    """Decision 13: the digest's SSM check is the mode's — correlation reports rates vs references."""
+    seen: list[httpx.Request] = []
+    digest = checked(
+        with_node_api(
+            node_api(
+                mode="correlation",
+                unattended=correlated([3000.0, 1500.0, 1500.0, 750.0], ["high", "medium", "medium", "low"]),
+                seen=seen,
+            ),
+            ALICE,
+            ssm_questions=4,
+        )
+    )
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "correlation"
+    assert ssm.status is Status.OK
+    assert "/node/calibration" in [request.url.path for request in seen], "correlation shows rates vs references"
 
 
 def test_a_failed_hardware_probe_does_not_stop_the_games() -> None:
@@ -1541,13 +1686,18 @@ def test_a_game_action_is_allowed_the_game_plus_the_call_that_starts_it() -> Non
     assert one_game_budget(generous) == pytest.approx(930.0)
 
 
-def test_checking_a_node_is_allowed_both_its_games() -> None:
-    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody."""
+def test_checking_a_node_is_allowed_every_call_and_game_it_makes() -> None:
+    """The disagreement this deletes: 900s of budget for 1200s of Games, chosen by nobody.
+
+    The budget is the sum of what a Node's check-up spends: six reads (hardware, availability,
+    Operation mode, follower address, the follower's mode and a correlation-mode calibration)
+    and three Games (CHSH, Quantum Fortune and SSM).
+    """
     settings = settings_for()
 
-    assert one_node_budget(settings) == pytest.approx(2 * 30.0 + 2 * 600.0)
+    assert one_node_budget(settings) == pytest.approx(6 * 30.0 + 3 * 600.0)
     assert FlowSpy.actions["check_node"].timeout_for(settings) == pytest.approx(one_node_budget(settings))
-    assert one_node_budget(settings) >= 2 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
+    assert one_node_budget(settings) >= 3 * settings.per_game_timeout_s, "a Node's Games must fit its budget"
 
 
 def test_a_budget_that_cannot_be_worked_out_falls_back_rather_than_refusing_to_run() -> None:

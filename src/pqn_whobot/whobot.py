@@ -203,14 +203,18 @@ def whole_digest_budget(settings: WhobotSettings) -> float:
 
 
 def one_node_budget(settings: WhobotSettings) -> float:
-    """How long checking one Node over may take: two Node calls, then both Games it may play.
+    """How long checking one Node over may take: its Node calls, then the Games it may play.
 
     Derived rather than configured. A ``per_node_timeout_s`` key would be a second statement of
     the same thing, free to disagree with it — and it did: the default was 900s while two Games
     at 600s each need 1200s, so a Node whose Games were merely slow lost both measurements to a
     budget nobody had chosen.
+
+    The calls are the hardware probe and the Game availability read; the Node's Operation mode,
+    its follower address and that follower's mode; and the Reference rates a correlation-mode SSM
+    report shows beside each measured one. The Games are CHSH, Quantum Fortune and SSM.
     """
-    return 2 * settings.node_timeout_s + 2 * settings.per_game_timeout_s
+    return 6 * settings.node_timeout_s + 3 * settings.per_game_timeout_s
 
 
 SCHEDULE_BOUNDS = {"hour": (0, 23), "minute": (0, 59)}
@@ -219,6 +223,9 @@ and ``test_the_schedule_action_refuses_what_the_config_would`` keeps the two in 
 
 DIGEST_TITLE = "Daily Digest"
 """What the fleet-wide report is called, whether it was scheduled or asked for by hand."""
+
+OPERATION_MODE_LABEL = "Operation mode"
+"""The digest section that states a Node's Operation mode and whether its follower agrees."""
 
 BELL_CLASSICAL_LIMIT = 2.0
 """An S above this is the Bell inequality being violated, which is the point of the exercise."""
@@ -1218,7 +1225,9 @@ class Whobot(ABC):
         except NodeApiError as e:
             sections = [_failed_section("Hardware", "The hardware probe failed.", str(e))]
 
-        sections += await self._play_games(node)
+        mode_section, mode = await self._operation_mode_section(node)
+        sections.append(mode_section)
+        sections += await self._play_games(node, mode)
 
         return NodeDigest(
             name=node.name,
@@ -1227,12 +1236,72 @@ class Whobot(ABC):
             sections=sections,
         )
 
-    async def _play_games(self, node: Node) -> list[Section]:
+    async def _operation_mode_section(self, node: Node) -> tuple[Section, OperationMode | None]:
+        """State this Node's Operation mode and whether its follower agrees (decision 9).
+
+        The mode is a Node-level fact — it changes what the GUI tells CHSH players too — so it is
+        reported for every reachable Node whether or not SSM is offered, and the read is handed
+        back so the SSM section need not ask again. A mismatch is an operator mistake, never
+        coordinated away (decision 9), so it is flagged rather than corrected.
+        """
+        try:
+            mode = await self._client(node).get_operation_mode(self.settings.node_timeout_s)
+        except NodeApiError as e:
+            # The SSM section reads the mode itself and reports its own failure as 3.2 does.
+            return (
+                Section(
+                    label=OPERATION_MODE_LABEL,
+                    status=Status.WARN,
+                    fields=[Field(name="Operation mode", value="unknown", status=Status.WARN)],
+                    error=str(e),
+                ),
+                None,
+            )
+
+        follower = await self._follower_mode_field(node, mode)
+        fields = [Field(name="Operation mode", value=mode.value, status=Status.OK), follower]
+        return Section(label=OPERATION_MODE_LABEL, status=Status.overall(f.status for f in fields), fields=fields), mode
+
+    async def _follower_mode_field(self, node: Node, mode: OperationMode) -> Field:
+        """Flag the follower when it plays in a different mode, per A13.
+
+        The follower is the address this Node itself uses for one (decision 15): read it from
+        ``/node/config`` and ask that address directly. A follower's mode that cannot be read is
+        reported as unknown and WARNs, so a mismatch is never hidden behind a failure.
+        """
+        try:
+            config = await self._client(node).get_config(self.settings.node_timeout_s)
+        except NodeApiError as e:
+            return Field(
+                name="Follower mode", value=f"unknown, could not read this Node's config: {e}", status=Status.WARN
+            )
+
+        address = config.follower_node_address
+        if not address:
+            return Field(name="Follower mode", value="none configured", status=Status.OK)
+
+        try:
+            follower_mode = await self._client(Node(api_url=f"http://{address}", reachable=True)).get_operation_mode(
+                self.settings.node_timeout_s
+            )
+        except NodeApiError as e:
+            return Field(name="Follower mode", value=f"unknown at {address}: {e}", status=Status.WARN)
+
+        if follower_mode is mode:
+            return Field(name="Follower mode", value=follower_mode.value, status=Status.OK)
+        return Field(
+            name="Follower mode",
+            value=f"{follower_mode.value} at {address}, but this Node plays in {mode.value} mode",
+            status=Status.WARN,
+        )
+
+    async def _play_games(self, node: Node, mode: OperationMode | None) -> list[Section]:
         """Ask the Node which Games it offers, and play the ones it does.
 
         Availability that cannot be read skips every Game rather than assuming all of them are
         on. Whether a Game may run is the *Node's* answer to give: assuming is how an unattended
-        run plays a Game an operator deliberately switched off.
+        run plays a Game an operator deliberately switched off. ``mode`` is the Operation mode
+        already read for the digest (decision 13); ``None`` makes the SSM section read it itself.
         """
         try:
             availability = await self._client(node).get_availability(self.settings.node_timeout_s)
@@ -1251,12 +1320,22 @@ class Whobot(ABC):
         else:
             sections.append(_skipped_section(GAME_TITLES["qf"], "Not available on this Node."))
 
-        # SSM is never played, whether it is available or not — hence no branch on availability.
-        sections.append(
-            _skipped_section(
-                GAME_TITLES["ssm"], "Needs an interactive coordination dance, so an unattended run cannot play it."
+        if availability.ssm:
+            # The Node plays SSM with the digest's own Answers: empty fields take the mode's
+            # default pattern for this many questions, and no integration time is sent (A9).
+            sections.append(
+                await self._play_ssm(
+                    node,
+                    self.settings.ssm_questions,
+                    "",
+                    "",
+                    self.settings.ssm_max_error_rate,
+                    0.0,
+                    mode=mode,
+                )
             )
-        )
+        else:
+            sections.append(_skipped_section(GAME_TITLES["ssm"], "Not available on this Node."))
         return sections
 
     async def _play_chsh(self, node: Node, basis: tuple[float, float]) -> Section:
