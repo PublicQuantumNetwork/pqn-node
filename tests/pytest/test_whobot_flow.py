@@ -1481,6 +1481,10 @@ def test_a_node_whose_own_mode_cannot_be_read_warns_and_the_ssm_section_fails_on
     mode_section = sections_of(digest)[OPERATION_MODE_LABEL]
     assert mode_section.status is Status.WARN
     assert mode_section.error is not None
+    # The row still says which fact is unknown, so the section reads as a report rather than a blank.
+    mode_row = next(field for field in mode_section.fields if field.name == "Operation mode")
+    assert mode_row.value == "unknown"
+    assert mode_row.status is Status.WARN
     ssm = sections_of(digest)[GAME_TITLES["ssm"]]
     assert ssm.status is Status.FAIL
     assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "unknown"
