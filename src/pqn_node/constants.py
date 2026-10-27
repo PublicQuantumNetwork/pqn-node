@@ -12,6 +12,14 @@ class OperationMode(StrEnum):
     CORRELATION = "correlation"
 
 
+class CoincidenceLevel(StrEnum):
+    """How many coincidences a setting gives relative to the Reference rates: high, medium or low."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 class QKDAngleValuesHWP(Enum):
     """The half waveplate angles that set H, V, D and A. Waveplate angles, not polarization angles."""
 
