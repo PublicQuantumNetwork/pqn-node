@@ -172,16 +172,23 @@ class FakePair:
     """A leading Node with a fake waveplate, playing against the fake follower and time tagger.
 
     ``integration_times`` records what the time tagger was asked to integrate for, one entry
-    per measurement.
+    per measurement, and ``plates`` holds waveplates the router serves by device name, for
+    tests that tell two rotators apart.
     """
 
     def __init__(
-        self, client: TestClient, plate: FakeWaveplate, follower: FakeFollower, integration_times: list[float]
+        self,
+        client: TestClient,
+        plate: FakeWaveplate,
+        follower: FakeFollower,
+        integration_times: list[float],
+        plates: dict[tuple[str, str], FakeWaveplate],
     ) -> None:
         self.client = client
         self.plate = plate
         self.follower = follower
         self.integration_times = integration_times
+        self.plates = plates
 
 
 @pytest.fixture(autouse=True)
@@ -240,13 +247,16 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
     def make(follower: FakeFollower) -> FakePair:
         plate = FakeWaveplate()
         integration_times: list[float] = []
+        # A waveplate per device name, for tests that tell two rotators apart; every device
+        # the map does not name gets the one shared plate.
+        plates: dict[tuple[str, str], FakeWaveplate] = {}
 
         class FakeRouterClient:
             def __init__(self, **_: object) -> None:
                 pass
 
-            def get_device(self, *_: object) -> FakeWaveplate:
-                return plate
+            def get_device(self, provider: str, name: str) -> FakeWaveplate:
+                return plates.get((provider, name), plate)
 
         monkeypatch.setattr(hardware, "Client", FakeRouterClient)
         monkeypatch.setattr(settings, "follower_node_address", "follower.invalid:8000")
@@ -269,7 +279,7 @@ def make_game(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[FakeFollowe
 
         app.dependency_overrides[get_http_client] = fake_http_client
         # No `with` block on the TestClient: the lifespan startup health check probes real hardware.
-        return FakePair(TestClient(app), plate, follower, integration_times)
+        return FakePair(TestClient(app), plate, follower, integration_times, plates)
 
     yield make
     app.dependency_overrides.pop(get_http_client, None)
@@ -350,19 +360,27 @@ def test_the_correlation_follower_moves_by_its_own_answers(
 ) -> None:
     """The follower's Answers alone move its own waveplate, left → V and right → D, one move per handshake.
 
-    Decision 3: the leader never fetches the follower's Answers in correlation mode, so the
-    follower records none of them for it.
+    Its waveplate is the one named in request_hwp, not the leader's hwp: with the two
+    rotators named apart, only the request one moves. Decision 3: the leader never fetches
+    the follower's Answers in correlation mode, so the follower records none of them for it.
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    monkeypatch.setattr(settings.qkd_settings, "hwp", ("provider", "leader"))
+    monkeypatch.setattr(settings.qkd_settings, "request_hwp", ("provider", "request"))
     game_state.qkd_follower_basis_list = [QKDEncodingBasis.DA, QKDEncodingBasis.HV]
     game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[]))
+    leader_plate = FakeWaveplate()
+    request_plate = FakeWaveplate()
+    game.plates[("provider", "leader")] = leader_plate
+    game.plates[("provider", "request")] = request_plate
 
     responses = [game.client.post("/qkd/single_bit") for _ in game_state.qkd_follower_basis_list]
 
     assert [response.status_code for response in responses] == [HTTPStatus.OK, HTTPStatus.OK]
     assert [response.json() for response in responses] == [True, True]
-    assert game.plate.moves == [CALIBRATED["d"], CALIBRATED["v"]]
+    assert request_plate.moves == [CALIBRATED["d"], CALIBRATED["v"]]
+    assert leader_plate.moves == []
     assert game_state.qkd_request_basis_list == []
     assert game_state.qkd_request_bit_list == []
 
@@ -405,19 +423,23 @@ def test_a_rate_is_classified_by_its_nearest_reference_rate(rate: float, expecte
 
 
 def test_classification_follows_the_configured_reference_rates(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Decision 7: the nearest of this Node's own Reference rates, whatever they are set to."""
-    rates = settings.correlation_settings.reference_rates
-    monkeypatch.setattr(rates, "vv", 200.0)
-    monkeypatch.setattr(rates, "vd", 80.0)
-    monkeypatch.setattr(rates, "dd", 20.0)
+    """Decision 7: the nearest of this Node's own Reference rates, whatever they are set to.
 
-    assert _coincidence_level(200.0) is CoincidenceLevel.HIGH
-    assert _coincidence_level(150.0) is CoincidenceLevel.HIGH
-    assert _coincidence_level(80.0) is CoincidenceLevel.MEDIUM
-    assert _coincidence_level(100.0) is CoincidenceLevel.MEDIUM
-    assert _coincidence_level(60.0) is CoincidenceLevel.MEDIUM
-    assert _coincidence_level(20.0) is CoincidenceLevel.LOW
-    assert _coincidence_level(10.0) is CoincidenceLevel.LOW
+    VV is its own configured value here, not twice VD (2800 where twice 1500 is 3000), and
+    2200 cps is nearer VV than VD only with the real 2800.
+    """
+    rates = settings.correlation_settings.reference_rates
+    monkeypatch.setattr(rates, "vv", 2800.0)
+    monkeypatch.setattr(rates, "vd", 1500.0)
+    monkeypatch.setattr(rates, "dd", 750.0)
+
+    assert _coincidence_level(2800.0) is CoincidenceLevel.HIGH
+    assert _coincidence_level(2200.0) is CoincidenceLevel.HIGH
+    assert _coincidence_level(2000.0) is CoincidenceLevel.MEDIUM
+    assert _coincidence_level(1200.0) is CoincidenceLevel.MEDIUM
+    assert _coincidence_level(1000.0) is CoincidenceLevel.LOW
+    assert _coincidence_level(750.0) is CoincidenceLevel.LOW
+    assert _coincidence_level(100.0) is CoincidenceLevel.LOW
     assert _coincidence_level(5000.0) is CoincidenceLevel.HIGH
 
 
@@ -479,8 +501,9 @@ def test_a_correlation_game_end_to_end(
     # Every question was measured for the CHSH config's 2 s, not the QKD settings' 3 s or any
     # other time, and each count became a rate with that same time.
     assert game.integration_times == [2.0, 2.0, 2.0, 2.0]
-    # A correlation game records no random bits of its own.
+    # A correlation game records no random bits of its own, and its Answers stay put.
     assert game_state.qkd_bit_list == []
+    assert game_state.qkd_leader_basis_list == [ANSWER_TO_BASIS[answer] for answer in [LEFT, LEFT, RIGHT, RIGHT]]
     # The follower got the same result, one handshake per question, and its Answers were never fetched.
     assert follower.results == [response.json()]
     assert_answers_never_fetched(follower)
@@ -521,8 +544,10 @@ def test_an_entanglement_game_end_to_end(
     # The random bit still picks the state within each Answer's basis, on both sides.
     assert game.plate.moves == [CALIBRATED[name] for name in ["h", "a", "h", "a"]]
     assert follower.moves == [CALIBRATED[name] for name in ["v", "d", "a", "h"]]
-    # The leader recorded exactly the random bits it moved by, one per question.
+    # The leader recorded exactly the random bits it moved by, one per question, and its
+    # Answers stayed put, as they do today.
     assert game_state.qkd_bit_list == [0, 1, 0, 1]
+    assert game_state.qkd_leader_basis_list == [ANSWER_TO_BASIS[answer] for answer in [LEFT, RIGHT, LEFT, RIGHT]]
     assert follower.results == [response.json()]
     # Today's game still fetches the follower's Answers.
     assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
@@ -543,7 +568,7 @@ def test_an_entanglement_game_where_no_answer_matches(
     monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 2)
     game_state.role = NodeRole.LEADER
     game_state.followers_address = "follower.invalid:8000"
-    follower = FakeFollower(mode=OperationMode.ENTANGLEMENT, answers=[RIGHT, RIGHT], bits=[0, 1])
+    follower = FakeFollower(mode=OperationMode.ENTANGLEMENT, answers=[RIGHT, RIGHT], bits=[0, 1], source=entangled_rate)
     game = make_game(follower)
     assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
 
@@ -697,20 +722,21 @@ def test_a_fractional_integration_time_divides_the_count_exactly(
     game_state: NodeState,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fractional integration time is divided out exactly as it was measured with.
+    """A fractional integration time is asked for and divided out exactly as it is configured.
 
-    A source giving 1000 cps over the configured 2.5 s counts 2500, whose rate is 1000 cps
-    (low → agreed); dividing by a rounded or truncated 2 s instead would give 1250 cps
-    (medium → disagreed).
+    The configured 0.25 s is below 1 s and not a multiple of 0.1 s, so a time rounded to
+    tenths (0.2 s) or floored at a second (1 s) shows in what the time tagger was asked
+    for. A source giving 1000 cps over the 0.25 s counts 250, whose rate is 1000 cps
+    (low → agreed).
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
-    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=2.5))
+    monkeypatch.setattr(settings.chsh_settings, "measurement_config", MeasurementConfig(integration_time_s=0.25))
     game_state.qkd_leader_basis_list = [QKDEncodingBasis.HV]
     game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT], source=RateSequence([1000.0])))
 
     response = game.client.post("/qkd", params={"timetagger_address": "tt.invalid:9000"})
 
     assert response.status_code == HTTPStatus.OK
-    assert game.integration_times == [2.5]
+    assert game.integration_times == [0.25]
     assert response.json() == [1]
