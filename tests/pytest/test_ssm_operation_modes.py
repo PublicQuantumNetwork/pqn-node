@@ -310,8 +310,9 @@ def assert_answers_never_fetched(follower: FakeFollower) -> None:
 class LeaderMoveCase(NamedTuple):
     """One leader move case: its Answers, the Calibrated angles they move to, and the agreement bits.
 
-    The follower answers left twice, so a right answer lands on a medium VD level and shows
-    up as a disagreement while the leader's moves stay exactly its own Answers'.
+    The follower answers left on every question, so a right answer lands on a medium VD
+    level and shows up as a disagreement while the leader's moves stay exactly its own
+    Answers', question after question through a six-question game in the last case.
     """
 
     answers: list[str]
@@ -322,10 +323,11 @@ class LeaderMoveCase(NamedTuple):
 LEADER_MOVE_CASES = [
     LeaderMoveCase([LEFT, RIGHT], ["v", "d"], [1, 0]),
     LeaderMoveCase([RIGHT, LEFT], ["d", "v"], [0, 1]),
+    LeaderMoveCase([LEFT, RIGHT, LEFT, RIGHT, LEFT, RIGHT], ["v", "d", "v", "d", "v", "d"], [1, 0, 1, 0, 1, 0]),
 ]
 
 
-@pytest.mark.parametrize("case", LEADER_MOVE_CASES, ids=["left then right", "right then left"])
+@pytest.mark.parametrize("case", LEADER_MOVE_CASES, ids=["left then right", "right then left", "six questions"])
 def test_the_correlation_leader_moves_by_its_own_answers(
     make_game: Callable[[FakeFollower], FakePair],
     game_state: NodeState,
@@ -335,11 +337,11 @@ def test_the_correlation_leader_moves_by_its_own_answers(
     """The leader's Answers alone move its own waveplate, left → V and right → D, whatever the follower answered.
 
     Its waveplate is the one named in qkd_settings.hwp, not the follower's request_hwp: with
-    the two rotators named apart, only the hwp one moves. The follower answers left twice,
-    so a right answer lands on a medium VD level and shows up as a disagreement while the
-    leader's moves stay exactly its own Answers'. The leader also starts with bits left over
-    from an earlier entanglement game and no reset between games, which its correlation
-    moves must ignore.
+    the two rotators named apart, only the hwp one moves. The follower answers left on every
+    question, so a right answer lands on a medium VD level and shows up as a disagreement
+    while the leader's moves stay exactly its own Answers', through a six-question game in
+    the last case. The leader also starts with bits left over from an earlier entanglement
+    game and no reset between games, which its correlation moves must ignore.
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
@@ -348,7 +350,7 @@ def test_the_correlation_leader_moves_by_its_own_answers(
     game_state.qkd_leader_basis_list = [ANSWER_TO_BASIS[answer] for answer in case.answers]
     # Bits an earlier entanglement game recorded, left in place by a missing reset.
     game_state.qkd_bit_list = [0, 1]
-    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT, LEFT]))
+    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[LEFT] * len(case.answers)))
     leader_plate = FakeWaveplate()
     request_plate = FakeWaveplate()
     game.plates[("provider", "leader")] = leader_plate
@@ -373,14 +375,22 @@ def test_the_correlation_follower_moves_by_its_own_answers(
     """The follower's Answers alone move its own waveplate, left → V and right → D, one move per handshake.
 
     Its waveplate is the one named in request_hwp, not the leader's hwp: with the two
-    rotators named apart, only the request one moves. Decision 3: the leader never fetches
-    the follower's Answers in correlation mode, so the follower records none of them for it.
+    rotators named apart, only the request one moves, on every question of a six-question
+    game. Decision 3: the leader never fetches the follower's Answers in correlation mode,
+    so the follower records none of them for it.
     """
     monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
     monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
     monkeypatch.setattr(settings.qkd_settings, "hwp", ("provider", "leader"))
     monkeypatch.setattr(settings.qkd_settings, "request_hwp", ("provider", "request"))
-    game_state.qkd_follower_basis_list = [QKDEncodingBasis.DA, QKDEncodingBasis.HV]
+    game_state.qkd_follower_basis_list = [
+        QKDEncodingBasis.DA,
+        QKDEncodingBasis.HV,
+        QKDEncodingBasis.DA,
+        QKDEncodingBasis.HV,
+        QKDEncodingBasis.DA,
+        QKDEncodingBasis.HV,
+    ]
     game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[]))
     leader_plate = FakeWaveplate()
     request_plate = FakeWaveplate()
@@ -389,10 +399,34 @@ def test_the_correlation_follower_moves_by_its_own_answers(
 
     responses = [game.client.post("/qkd/single_bit") for _ in game_state.qkd_follower_basis_list]
 
-    assert [response.status_code for response in responses] == [HTTPStatus.OK, HTTPStatus.OK]
-    assert [response.json() for response in responses] == [True, True]
-    assert request_plate.moves == [CALIBRATED["d"], CALIBRATED["v"]]
+    assert all(response.status_code == HTTPStatus.OK for response in responses)
+    assert [response.json() for response in responses] == [True] * len(responses)
+    assert request_plate.moves == [CALIBRATED[name] for name in ["d", "v", "d", "v", "d", "v"]]
     assert leader_plate.moves == []
+    assert game_state.qkd_request_basis_list == []
+    assert game_state.qkd_request_bit_list == []
+
+
+def test_a_one_question_follower_correlation_game(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single Answer is a whole follower game in correlation mode: one move by that Answer, nothing recorded.
+
+    A one-question game must not fall back to the entanglement path, whose random bit and
+    recorded Answers belong to today's game alone (decisions 1, 3 and 4).
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.CORRELATION)
+    monkeypatch.setattr(qkd, "secrets", SimpleNamespace(randbits=_no_random_bit))
+    game_state.qkd_follower_basis_list = [QKDEncodingBasis.DA]
+    game = make_game(FakeFollower(mode=OperationMode.CORRELATION, answers=[]))
+
+    response = game.client.post("/qkd/single_bit")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() is True
+    assert game.plate.moves == [CALIBRATED["d"]]
     assert game_state.qkd_request_basis_list == []
     assert game_state.qkd_request_bit_list == []
 
@@ -633,6 +667,37 @@ def test_a_one_question_entanglement_game(
     assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
 
 
+def test_an_entanglement_game_with_more_than_eight_matching_answers(
+    make_game: Callable[[FakeFollower], FakePair],
+    game_state: NodeState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entanglement game with nine matching Answers reports all nine (decision 4).
+
+    Every Answer matches, so today's count is the question count, however long the game.
+    """
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.ENTANGLEMENT)
+    monkeypatch.setattr(qkd, "secrets", FixedBits([0] * 9))
+    monkeypatch.setattr(settings.qkd_settings, "bitstring_length", 9)
+    game_state.role = NodeRole.LEADER
+    game_state.followers_address = "follower.invalid:8000"
+    follower = FakeFollower(
+        mode=OperationMode.ENTANGLEMENT,
+        answers=[LEFT] * 9,
+        bits=[1] * 9,
+        source=entangled_rate,
+    )
+    game = make_game(follower)
+    assert game.client.post("/qkd/set_emoji", params={"emoji": "🙈"}).status_code == HTTPStatus.OK
+
+    response = start_ssm_game(game, [LEFT] * 9)
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"n_matching_bits": 9, "n_total_bits": 9, "emoji": "🙈", "role": "leader"}
+    assert follower.results == [response.json()]
+    assert any(request.url.path == "/qkd/request_basis_list" for request in follower.requests)
+
+
 def test_a_one_question_correlation_game_that_disagrees(
     make_game: Callable[[FakeFollower], FakePair],
     game_state: NodeState,
@@ -799,8 +864,9 @@ def test_a_fractional_integration_time_divides_the_count_exactly(
 class CorrelationGameCase(NamedTuple):
     """One table-driven correlation game: its Reference rates, integration time and counts.
 
-    The counts are the time tagger's, one per question, scripted through the source; every
-    case but the last has equal first and last counts with a different level between them.
+    The counts are the time tagger's, one per question, scripted through the source; most
+    cases have equal first and last counts with a different level between them, and the
+    last two run a default-length and a nine-question game.
     """
 
     name: str
@@ -827,6 +893,33 @@ CORRELATION_GAME_CASES = [
         {"vv": 3000.6, "vd": 1503.4, "dd": 750.2},
         60.0,
         [135111, 90204, 67557],
+    ),
+    CorrelationGameCase(
+        "VD not floored at twice DD", {"vv": 3000.0, "vd": 1500.0, "dd": 900.0}, 1.0, [2300, 1500, 2300]
+    ),
+    CorrelationGameCase(
+        "VV not capped at 2.5 times VD", {"vv": 4500.0, "vd": 1500.0, "dd": 750.0}, 1.0, [2800, 4500, 2800]
+    ),
+    CorrelationGameCase(
+        "rates beyond ten thousand", {"vv": 40000.0, "vd": 20000.0, "dd": 10000.0}, 1.0, [40000, 20000, 40000]
+    ),
+    CorrelationGameCase(
+        "the high/medium boundary within a tenth of a cps",
+        {"vv": 3000.0, "vd": 1500.0, "dd": 750.0},
+        10.0,
+        [22499, 22500, 22499],
+    ),
+    CorrelationGameCase(
+        "six questions, the default game length",
+        {"vv": 3000.0, "vd": 1500.0, "dd": 750.0},
+        1.0,
+        [3000, 1500, 3000, 1500, 3000, 1500],
+    ),
+    CorrelationGameCase(
+        "nine questions, an agreement after the eighth",
+        {"vv": 3000.0, "vd": 1500.0, "dd": 750.0},
+        1.0,
+        [3000, 1500, 3000, 1500, 3000, 1500, 3000, 1500, 3000],
     ),
 ]
 
