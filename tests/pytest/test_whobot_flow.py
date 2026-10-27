@@ -1468,15 +1468,34 @@ def test_the_mode_read_is_reused_by_the_ssm_section() -> None:
     assert len(reads) == 1, "the mode is read once and reused for the SSM report"
 
 
-def test_a_node_whose_own_mode_cannot_be_read_warns_and_still_plays_ssm() -> None:
-    """A mode read that fails is a WARN on the mode section, not a lost check-up."""
+def test_a_node_whose_own_mode_cannot_be_read_warns_and_the_ssm_section_fails_on_its_own() -> None:
+    """A mode read that fails is a WARN on the mode section; the SSM section then fails too.
+
+    The SSM section needs the mode to pick its default Answers, so with no Answers given it
+    reports the failure rather than playing. Its mode row says "unknown".
+    """
     digest = checked(with_node_api(node_api(refuse={"/node/operation_mode": 503}), ALICE))
 
     mode_section = sections_of(digest)[OPERATION_MODE_LABEL]
     assert mode_section.status is Status.WARN
     assert mode_section.error is not None
-    # The SSM section reads the mode itself, so its own status still follows the game.
-    assert sections_of(digest)[GAME_TITLES["ssm"]].status is Status.FAIL
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert ssm.status is Status.FAIL
+    assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "unknown"
+
+
+def test_a_config_read_that_fails_warns_the_follower_row_and_asks_no_follower() -> None:
+    """When this Node's own config cannot be read, the follower is unknown and never asked."""
+    seen: list[httpx.Request] = []
+    digest = checked(with_node_api(node_api(refuse={"/node/config": 503}, seen=seen), ALICE, node_timeout_s=0.5))
+
+    follower = next(
+        field for field in sections_of(digest)[OPERATION_MODE_LABEL].fields if field.name == "Follower mode"
+    )
+    assert follower.status is Status.WARN
+    assert follower.value.startswith("unknown")
+    assert "config" in follower.value
+    assert {request.url.host for request in seen} == {"node-a.invalid"}, "only this Node was asked"
 
 
 def test_a_matching_follower_mode_is_shown_without_a_warning() -> None:
@@ -1545,6 +1564,24 @@ def test_the_digests_ssm_check_follows_the_nodes_mode() -> None:
     assert {field.name: field.value for field in ssm.fields}["Operation mode"] == "correlation"
     assert ssm.status is Status.OK
     assert "/node/calibration" in [request.url.path for request in seen], "correlation shows rates vs references"
+
+
+def test_the_digests_ssm_status_follows_the_configured_max_error_rate() -> None:
+    """Decision 13: the SSM section WARNs when a basis's error rate is above ``ssm_max_error_rate``.
+
+    A non-default threshold is used so a hard-coded 0.15 would fail: the bits disagree on every
+    compared question, so the rate is 1.0 and the check warns against the configured 0.25.
+    """
+    digest = checked(
+        with_node_api(
+            node_api(unattended=entangled([0, 0, 0, 0], [1, 1, 1, 1])), ALICE, ssm_questions=4, ssm_max_error_rate=0.25
+        )
+    )
+
+    ssm = sections_of(digest)[GAME_TITLES["ssm"]]
+    assert ssm.status is Status.WARN
+    fields = {field.name: field for field in ssm.fields}
+    assert fields["Max error rate"].value == "0.25"
 
 
 def test_a_failed_hardware_probe_does_not_stop_the_games() -> None:
