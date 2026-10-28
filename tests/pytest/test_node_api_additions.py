@@ -208,6 +208,72 @@ def test_request_angle_by_basis_moves_to_half_the_basis_angle_plus_90_when_perp(
     assert waveplate.moves == [22.5 / 2, (67.5 + 90) / 2]
 
 
+@pytest.mark.usefixtures("waveplate")
+def test_request_angle_by_basis_answers_with_the_polarization_it_moved_to(client: TestClient) -> None:
+    response = client.post("/chsh/request-angle-by-basis", params={"index": 1, "perp": True})
+
+    assert response.json() == {"polarization": 67.5 + 90, "waveplate": (67.5 + 90) / 2}
+
+
+def follower_reporting_its_angle(request: httpx.Request) -> httpx.Response:
+    """Answer as a follower at the default basis that says where it moved, and a timetagger counting 100.
+
+    Its waveplate sits 1° past half the polarization, so a leader that worked the angle out
+    for itself instead of taking the follower's word would be caught.
+    """
+    if request.url.path == "/chsh/request-angle-by-basis":
+        angle = [22.5, 67.5][int(request.url.params["index"])] + 90 * (request.url.params["perp"] == "True")
+        return httpx.Response(200, json={"polarization": angle, "waveplate": angle / 2 + 1})
+    return httpx.Response(200, json=100)
+
+
+def test_chsh_reports_where_both_waveplates_were_sent_at_every_setting(
+    client: TestClient, waveplate: FakeWaveplate, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "follower_node_address", "follower.invalid:8000")
+
+    async def fake_http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(follower_reporting_its_angle)) as http_client:
+            yield http_client
+
+    app.dependency_overrides[get_http_client] = fake_http_client
+    try:
+        # The leader measures at (0, |a - b| % 90), not at the angles asked for.
+        response = client.post("/chsh/", params={"timetagger_address": "tt.invalid:9000"}, json=[10.0, 55.0])
+    finally:
+        app.dependency_overrides.pop(get_http_client, None)
+
+    assert response.status_code == HTTPStatus.OK
+    measurements = response.json()["measurements"]
+    assert [(m["leader_polarization"], m["follower_polarization"]) for m in measurements] == [
+        (leader, follower)
+        for basis_angle in (0.0, 45.0)
+        for follower_basis in (22.5, 67.5)
+        for leader in (basis_angle, basis_angle + 90)
+        for follower in (follower_basis, follower_basis + 90)
+    ]
+    for m in measurements:
+        assert m["leader_waveplate"] == m["leader_polarization"] / 2
+        assert m["follower_waveplate"] == m["follower_polarization"] / 2 + 1
+        assert m["coincidences"] == 100  # noqa: PLR2004
+    assert waveplate.moves == [m["leader_waveplate"] for m in measurements[::2]]
+
+
+@pytest.mark.usefixtures("waveplate", "outbound")
+def test_chsh_leaves_the_angle_of_a_follower_that_does_not_report_one_unknown(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A follower from before it reported its move answers true."""
+    monkeypatch.setattr(settings, "follower_node_address", "follower.invalid:8000")
+
+    response = client.post("/chsh/", params={"timetagger_address": "tt.invalid:9000"}, json=[0.0, 45.0])
+
+    assert response.status_code == HTTPStatus.OK
+    assert {(m["follower_polarization"], m["follower_waveplate"]) for m in response.json()["measurements"]} == {
+        (None, None)
+    }
+
+
 def test_sweep_pins_the_follower_once_and_measures_every_step(
     client: TestClient,
     waveplate: FakeWaveplate,

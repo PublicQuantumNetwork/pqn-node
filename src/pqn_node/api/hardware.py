@@ -57,6 +57,12 @@ def find_timetagger() -> "TimeTaggerInstrument":
     return tagger
 
 
-def move_to_polarization(hwp: "RotatorInstrument", polarization_deg: float) -> None:
-    """Turn a half waveplate so it sets this polarization angle, which takes half as much turning."""
-    hwp.move_to(polarization_deg / 2)
+def move_to_polarization(hwp: "RotatorInstrument", polarization_deg: float) -> float:
+    """Turn a half waveplate so it sets this polarization angle, which takes half as much turning.
+
+    Returns the angle the waveplate was sent to, so a caller reports what was commanded rather
+    than working it out again.
+    """
+    waveplate_deg = polarization_deg / 2
+    hwp.move_to(waveplate_deg)
+    return waveplate_deg
