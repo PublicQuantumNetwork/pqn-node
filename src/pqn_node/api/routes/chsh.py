@@ -54,7 +54,6 @@ class ChshResult(BaseModel):
     expectation_values: list[float]
     expectation_errors: list[float]
     expectation_values_sign_fixed: list[float]
-    # Defaulted so a result from a Node that predates it still parses.
     measurements: list[ChshMeasurement] = []
 
 
