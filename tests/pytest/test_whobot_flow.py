@@ -929,6 +929,25 @@ CHSH = {
     "expectation_values_sign_fixed": [0.7, 0.65],
 }
 
+# Two of a real run's sixteen settings: enough to tell leader from follower and angle from waveplate.
+MEASUREMENTS: list[dict[str, object]] = [
+    {
+        "leader_polarization": 0.0,
+        "leader_waveplate": 0.0,
+        "follower_polarization": 22.5,
+        "follower_waveplate": 11.25,
+        "coincidences": 812,
+    },
+    {
+        "leader_polarization": 90.0,
+        "leader_waveplate": 45.0,
+        "follower_polarization": 22.5,
+        "follower_waveplate": 11.25,
+        "coincidences": 97,
+    },
+]
+CHSH_MEASURED = CHSH | {"measurements": MEASUREMENTS}
+
 SWEEP_FORM: dict[str, object] = {
     "follower_polarization": "D",
     "custom_angle": 0.0,
@@ -952,6 +971,7 @@ def node_api(
     *,
     health: object = HEALTHY,
     availability: object = ALL_GAMES_ON,
+    chsh: object = CHSH,
     refuse: dict[str, int] | None = None,
     seen: list[httpx.Request] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
@@ -963,7 +983,7 @@ def node_api(
     answers: dict[str, object] = {
         "/health/": health,
         "/games/availability": availability,
-        "/chsh/": CHSH,
+        "/chsh/": chsh,
         "/chsh/sweep": SWEEP,
         "/rng/fortune": [42, 137],
     }
@@ -1243,13 +1263,78 @@ def test_running_chsh_by_hand_measures_at_the_angles_asked_for() -> None:
     assert only_report(bot).status is Status.OK
 
 
+def chsh_fields(report: Report) -> dict[str, str]:
+    return {field.name: field.value for field in report.sections[0].fields}
+
+
+def test_chsh_names_the_angles_each_node_was_sent_to_rather_than_the_angles_asked_for() -> None:
+    """The leader measures at (0, |a - b| % 90) and the follower at its own basis, so asked is not used."""
+    bot = with_node_api(node_api(chsh=CHSH_MEASURED), ALICE)
+
+    pending = PendingInvocation(action="run_chsh", node_url=ALICE, params={"angle_a": 15.0, "angle_b": 60.0})
+    asyncio.run(dispatched(bot, pending))
+
+    report = only_report(bot)
+    assert len(report.sections) == 1, "the measurements only appear when asked for"
+    fields = chsh_fields(report)
+    assert fields["Leader polarizations"] == "0° (H), 90° (V)"
+    assert fields["Follower polarizations"] == "22.5°"
+    assert "Requested basis" not in fields
+
+
+def test_a_verbose_chsh_lists_every_setting_with_its_waveplate_angle() -> None:
+    bot = with_node_api(node_api(chsh=CHSH_MEASURED), ALICE)
+
+    pending = PendingInvocation(action="run_chsh", node_url=ALICE, params={"verbose": True})
+    asyncio.run(dispatched(bot, pending))
+
+    measurements = only_report(bot).sections[1]
+    assert measurements.label == "CHSH measurements"
+    assert [(f.name, f.value) for f in measurements.fields] == [
+        ("#1", "Leader 0° (H), HWP 0° · Follower 22.5°, HWP 11.25° · 812 coincidences"),
+        ("#2", "Leader 90° (V), HWP 45° · Follower 22.5°, HWP 11.25° · 97 coincidences"),
+    ]
+
+
+def test_the_digest_never_lists_the_chsh_settings() -> None:
+    """Sixteen lines per Node is a fleet's digest past Slack's message limit."""
+    digest = checked(with_node_api(node_api(chsh=CHSH_MEASURED), ALICE))
+
+    assert "CHSH measurements" not in sections_of(digest)
+
+
+def test_a_chsh_from_a_node_that_does_not_report_its_angles_says_what_was_asked_for() -> None:
+    bot = with_node_api(node_api(), ALICE)
+
+    pending = PendingInvocation(
+        action="run_chsh", node_url=ALICE, params={"angle_a": 15.0, "angle_b": 60.0, "verbose": True}
+    )
+    asyncio.run(dispatched(bot, pending))
+
+    report = only_report(bot)
+    assert len(report.sections) == 1, "nothing to list"
+    assert chsh_fields(report)["Requested basis"] == "15.0°, 60.0°"
+
+
+def test_a_follower_that_does_not_report_its_angle_is_said_to_have_not() -> None:
+    unreported = {"follower_polarization": None, "follower_waveplate": None}
+    chsh = CHSH | {"measurements": [m | unreported for m in MEASUREMENTS]}
+    bot = with_node_api(node_api(chsh=chsh), ALICE)
+
+    asyncio.run(dispatched(bot, PendingInvocation(action="run_chsh", node_url=ALICE, params={"verbose": True})))
+
+    report = only_report(bot)
+    assert chsh_fields(report)["Follower polarizations"] == "not reported by the follower"
+    assert report.sections[1].fields[0].value == "Leader 0° (H), HWP 0° · Follower not reported · 812 coincidences"
+
+
 def test_the_chsh_form_opens_on_the_angles_an_unattended_run_would_use() -> None:
     """So the operator sees what the digest measures, and changes it deliberately."""
     bot = with_node_api(node_api(), ALICE, basis=(11.0, 33.5))
 
     asyncio.run(dispatched(bot, PendingInvocation(action="run_chsh", node_url=ALICE)))
 
-    assert bot.drawn.initial == {"angle_a": 11.0, "angle_b": 33.5}
+    assert bot.drawn.initial == {"angle_a": 11.0, "angle_b": 33.5, "verbose": False}
 
 
 def test_running_a_fortune_by_hand_reports_what_each_channel_drew() -> None:

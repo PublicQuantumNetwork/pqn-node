@@ -24,8 +24,12 @@ from pydantic_settings import TomlConfigSettingsSource
 
 from pqn_node.core.config import write_config
 
-DEFAULT_BASIS: tuple[float, float] = (0.0, 22.5)
-"""The CHSH angles the digest measures at, and that "Run CHSH" falls back to when a field is cleared."""
+DEFAULT_BASIS: tuple[float, float] = (0.0, 45.0)
+"""The CHSH angles the digest measures at, and that "Run CHSH" falls back to when a field is cleared.
+
+0° and 45° against the follower's 22.5° and 67.5° is the textbook CHSH setting, the one that
+reaches the largest violation, S = 2√2.
+"""
 
 
 class ConfigWriteError(ValueError):

@@ -11,6 +11,7 @@ from fastapi import Query
 from fastapi import status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from pydantic import ValidationError
 
 from pqn_node.api.deps import ClientDep
 from pqn_node.api.deps import StateDep
@@ -25,12 +26,36 @@ from pqn_node.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class WaveplateMove(BaseModel):
+    """Where a Node sent its waveplate: the polarization angle, and the waveplate angle that set it."""
+
+    polarization: float
+    waveplate: float
+
+
+class ChshMeasurement(BaseModel):
+    """One of a CHSH run's sixteen settings: where both waveplates were sent, and what was counted.
+
+    Polarization angles, and the waveplate angles that set them. These are the angles commanded,
+    not read back from the motors. The follower's are ``None`` when it does not report them,
+    which a follower from before this field does not.
+    """
+
+    leader_polarization: float
+    leader_waveplate: float
+    follower_polarization: float | None
+    follower_waveplate: float | None
+    coincidences: int
+
+
 class ChshResult(BaseModel):
     chsh_value: float
     chsh_error: float
     expectation_values: list[float]
     expectation_errors: list[float]
     expectation_values_sign_fixed: list[float]
+    # Defaulted so a result from a Node that predates it still parses.
+    measurements: list[ChshMeasurement] = []
 
 
 class SweepResult(BaseModel):
@@ -127,12 +152,13 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
 
     expectation_values = []
     expectation_errors = []
+    measurements: list[ChshMeasurement] = []
     basis = (0, abs(basis[0] - basis[1]) % 90)
     for angle in basis:  # Going through my basis angles
         for i in range(2):  # Going through follower basis angles
             counts = []
             for a in [angle, (angle + 90)]:
-                move_to_polarization(hwp, a)
+                leader_waveplate = move_to_polarization(hwp, a)
                 for perp in [False, True]:
                     r = await http_client.post(
                         f"http://{follower_node_address}/chsh/request-angle-by-basis?index={i}&perp={perp}"
@@ -148,6 +174,16 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
                     counts.append(
                         await measure_coincidences(
                             http_client, timetagger_address, settings.chsh_settings.measurement_config
+                        )
+                    )
+                    follower = _reported_move(r.json())
+                    measurements.append(
+                        ChshMeasurement(
+                            leader_polarization=a,
+                            leader_waveplate=leader_waveplate,
+                            follower_polarization=None if follower is None else follower.polarization,
+                            follower_waveplate=None if follower is None else follower.waveplate,
+                            coincidences=counts[-1],
                         )
                     )
 
@@ -195,7 +231,19 @@ async def _chsh(  # Complexity is high due to the nature of the CHSH experiment.
         expectation_values=expectation_values,
         expectation_errors=expectation_errors,
         expectation_values_sign_fixed=expectation_values_sign_fixed,
+        measurements=measurements,
     )
+
+
+def _reported_move(body: object) -> WaveplateMove | None:
+    """Read where a follower says it sent its waveplate, or ``None`` if it did not say.
+
+    A follower from before it reported its move answers ``true``.
+    """
+    try:
+        return WaveplateMove.model_validate(body)
+    except ValidationError:
+        return None
 
 
 @router.post("/")
@@ -209,20 +257,24 @@ async def chsh(
     return await _chsh(basis, http_client, timetagger_address, state)
 
 
-def _move_request_hwp(angle: float) -> bool:
-    """Move this Node's requested waveplate, the one a leader steers, to a polarization angle."""
-    move_to_polarization(find_rotator(settings.chsh_settings.request_hwp), angle)
-    logger.info("moving waveplate", extra={"angle": angle})
-    return True
+def _move_request_hwp(angle: float) -> WaveplateMove:
+    """Move this Node's requested waveplate, the one a leader steers, to a polarization angle.
+
+    Returns where it went, so the leader can report this Node's waveplate without assuming
+    how this Node turns a polarization into a waveplate angle.
+    """
+    waveplate = move_to_polarization(find_rotator(settings.chsh_settings.request_hwp), angle)
+    logger.info("moving waveplate", extra={"angle": angle, "waveplate": waveplate})
+    return WaveplateMove(polarization=angle, waveplate=waveplate)
 
 
 @router.post("/request-angle-by-basis")
-async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = False) -> bool:
+async def request_angle_by_basis(index: int, state: StateDep, *, perp: bool = False) -> WaveplateMove:
     return _move_request_hwp(state.chsh_request_basis[index] + 90 * perp)
 
 
 @router.post("/request-angle")
-async def request_angle(angle: float) -> bool:
+async def request_angle(angle: float) -> WaveplateMove:
     """Move the requested waveplate to a free polarization angle, rather than one of the basis angles."""
     return _move_request_hwp(angle)
 

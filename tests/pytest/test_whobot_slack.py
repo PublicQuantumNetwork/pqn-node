@@ -495,6 +495,7 @@ def test_a_form_with_nothing_ticked_omits_initial_options() -> None:
 def test_a_float_parameter_becomes_a_number_input() -> None:
     """The second widget mapping, and the reason a CHSH run can be aimed from Slack."""
     blocks = WhobotSlack._form_blocks(chsh_action(), {"angle_a": 11.0, "angle_b": 33.5})  # noqa: SLF001
+    blocks = [b for b in blocks if b["block_id"] != PARAMS_BLOCK]  # Verbose is a checkbox, tested elsewhere
 
     assert [b["element"]["type"] for b in blocks] == ["number_input", "number_input"]
     assert [b["element"]["initial_value"] for b in blocks] == ["11.0", "33.5"]
@@ -553,7 +554,7 @@ def test_a_dropdown_pick_reads_back_as_the_enum_member() -> None:
 
 def test_an_action_with_no_booleans_renders_no_checkbox_group() -> None:
     """Slack rejects a checkbox element with no options, so an empty group must not be sent."""
-    blocks = WhobotSlack._form_blocks(chsh_action(), {})  # noqa: SLF001
+    blocks = WhobotSlack._form_blocks(schedule_action(), {})  # noqa: SLF001
 
     assert all(b["block_id"] != PARAMS_BLOCK for b in blocks)
 
@@ -566,7 +567,7 @@ def test_a_number_input_reads_back_as_the_actions_float() -> None:
         _param_block("angle_b"): {_param_block("angle_b"): {"type": "number_input", "value": "33"}},
     }
 
-    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 11.5, "angle_b": 33.0}  # noqa: SLF001
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 11.5, "angle_b": 33.0, "verbose": False}  # noqa: SLF001
 
 
 def test_a_number_input_left_empty_falls_back_to_the_actions_default() -> None:
@@ -574,7 +575,7 @@ def test_a_number_input_left_empty_falls_back_to_the_actions_default() -> None:
     act = chsh_action()
     state = {_param_block("angle_a"): {_param_block("angle_a"): {"type": "number_input", "value": ""}}}
 
-    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 0.0, "angle_b": 22.5}  # noqa: SLF001
+    assert act.coerce_params(WhobotSlack._read_form(act, state)) == {"angle_a": 0.0, "angle_b": 45.0, "verbose": False}  # noqa: SLF001
 
 
 def submitted(*ticked: str) -> dict[str, Any]:

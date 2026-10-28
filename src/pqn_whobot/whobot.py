@@ -92,6 +92,7 @@ from typing import Any
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
+from pqn_node.api.routes.chsh import ChshMeasurement
 from pqn_node.api.routes.health import ComponentStatus
 from pqn_node.api.routes.health import HealthStatus
 from pqn_node.constants import Polarization
@@ -394,16 +395,22 @@ class Whobot(ABC):
         timeout_s=one_game_budget,
     )
     async def run_chsh(
-        self, node: Node, *, angle_a: float = DEFAULT_BASIS[0], angle_b: float = DEFAULT_BASIS[1]
+        self,
+        node: Node,
+        *,
+        angle_a: float = DEFAULT_BASIS[0],
+        angle_b: float = DEFAULT_BASIS[1],
+        verbose: bool = False,
     ) -> Report:
         """Run one CHSH measurement and report what it measured.
 
         The angles are asked for because they are a choice: an operator running this by hand is
         usually running it *at* something. The digest, which nobody is watching, takes them from
-        configuration instead.
+        configuration instead. ``verbose`` adds every one of the sixteen settings the waveplates
+        were sent to, which is too long for the digest but what an operator chasing a bad S wants.
         """
-        section = await self._play_chsh(node, (angle_a, angle_b))
-        return Report(status=section.status or Status.OK, title=f"CHSH — {node.name}", sections=[section])
+        sections = await self._play_chsh(node, (angle_a, angle_b), verbose=verbose)
+        return Report(status=sections[0].status or Status.OK, title=f"CHSH — {node.name}", sections=sections)
 
     @prefill(run_chsh)
     async def _chsh_angles_prefill(self, _node: Node) -> dict[str, object]:
@@ -1080,7 +1087,7 @@ class Whobot(ABC):
 
         sections = []
         if availability.chsh:
-            sections.append(await self._play_chsh(node, self.settings.basis))
+            sections.extend(await self._play_chsh(node, self.settings.basis))
         else:
             sections.append(_skipped_section(GAME_TITLES["chsh"], "Not available on this Node."))
 
@@ -1097,8 +1104,11 @@ class Whobot(ABC):
         )
         return sections
 
-    async def _play_chsh(self, node: Node, basis: tuple[float, float]) -> Section:
-        """Run one CHSH at these angles, and describe what it measured or why it could not."""
+    async def _play_chsh(self, node: Node, basis: tuple[float, float], *, verbose: bool = False) -> list[Section]:
+        """Run one CHSH at these angles, and describe what it measured or why it could not.
+
+        One Section, or two when ``verbose``: the second lists every setting measured.
+        """
         label = GAME_TITLES["chsh"]
         started = time.monotonic()
         try:
@@ -1106,24 +1116,37 @@ class Whobot(ABC):
                 self.settings.timetagger_address, basis, self.settings.per_game_timeout_s
             )
         except NodeApiError as e:
-            return _failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)
+            return [_failed_section(label, "The Game did not complete.", str(e), time.monotonic() - started)]
 
         verdict = _bell_verdict(result.chsh_value)
-        return Section(
-            label=label,
-            status=verdict.status,
-            fields=[
-                verdict,
-                # Written out rather than dumped from the model: the error belongs beside the
-                # value it qualifies, and "S" is what a physicist calls this.
-                Field(name="S", value=f"{result.chsh_value:.4f} ± {result.chsh_error:.4f}"),
-                Field(name="Basis", value=f"{basis[0]:.1f}°, {basis[1]:.1f}°"),
-                Field(name="Expectation values", value=_angles(result.expectation_values)),
-                Field(name="Sign-fixed expectations", value=_angles(result.expectation_values_sign_fixed)),
-                Field(name="Expectation errors", value=_angles(result.expectation_errors)),
-            ],
-            note=f"{time.monotonic() - started:.1f}s",
-        )
+        sections = [
+            Section(
+                label=label,
+                status=verdict.status,
+                fields=[
+                    verdict,
+                    # Written out rather than dumped from the model: the error belongs beside the
+                    # value it qualifies, and "S" is what a physicist calls this.
+                    Field(name="S", value=f"{result.chsh_value:.4f} ± {result.chsh_error:.4f}"),
+                    *_chsh_angles(result.measurements, basis),
+                    Field(name="Expectation values", value=_angles(result.expectation_values)),
+                    Field(name="Sign-fixed expectations", value=_angles(result.expectation_values_sign_fixed)),
+                    Field(name="Expectation errors", value=_angles(result.expectation_errors)),
+                ],
+                note=f"{time.monotonic() - started:.1f}s",
+            )
+        ]
+        if verbose and result.measurements:
+            sections.append(
+                Section(
+                    label="CHSH measurements",
+                    fields=[
+                        Field(name=f"#{number}", value=_describe_measurement(measurement))
+                        for number, measurement in enumerate(result.measurements, start=1)
+                    ],
+                )
+            )
+        return sections
 
     async def _play_fortune(self, node: Node) -> Section:
         """Draw one Quantum Fortune, and describe what each channel got or why it could not."""
@@ -1176,6 +1199,38 @@ def _not_a_time_of_day(hour: int, minute: int) -> str | None:
         if not low <= value <= high:
             return f"{name} must be between {low} and {high}, not {value}"
     return None
+
+
+def _chsh_angles(measurements: list[ChshMeasurement], requested: tuple[float, float]) -> list[Field]:
+    """Say which polarizations each Node was sent to, in the order it was sent to them.
+
+    Not the requested basis: the leader measures at ``(0, |a - b| % 90)`` and the follower at
+    its own basis, so the angles asked for are not the angles used. A Node that predates
+    reporting them leaves nothing better to show than what was asked for, labelled as such.
+    """
+    if not measurements:
+        return [Field(name="Requested basis", value=f"{requested[0]:.1f}°, {requested[1]:.1f}°")]
+    leader = dict.fromkeys(m.leader_polarization for m in measurements)
+    follower = dict.fromkeys(m.follower_polarization for m in measurements if m.follower_polarization is not None)
+    return [
+        Field(name="Leader polarizations", value=", ".join(describe_angle(angle) for angle in leader)),
+        Field(
+            name="Follower polarizations",
+            value=", ".join(describe_angle(angle) for angle in follower) or "not reported by the follower",
+        ),
+    ]
+
+
+def _describe_measurement(measurement: ChshMeasurement) -> str:
+    """One setting of a CHSH run: both polarizations, the waveplate angles that set them, the count."""
+    leader = f"Leader {describe_angle(measurement.leader_polarization)}, HWP {measurement.leader_waveplate:g}°"
+    if measurement.follower_polarization is None or measurement.follower_waveplate is None:
+        follower = "Follower not reported"
+    else:
+        follower = (
+            f"Follower {describe_angle(measurement.follower_polarization)}, HWP {measurement.follower_waveplate:g}°"
+        )
+    return f"{leader} · {follower} · {measurement.coincidences} coincidences"
 
 
 def _angles(values: list[float]) -> str:
